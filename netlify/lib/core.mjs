@@ -32,6 +32,8 @@ function tempPass() {
   for (let i = 7; i > 0; i--) { const j = randomInt(i + 1); [c[i], c[j]] = [c[j], c[i]]; }
   return c.join('');
 }
+const zoneOf = (env) => { const z = String(env.TIMEZONE || '').trim(); try { new Intl.DateTimeFormat('en-GB', { timeZone: z }); return z; } catch (e) { return 'Asia/Kolkata'; } };
+const goodUrl = (u) => { const t = String(u || '').trim().replace(/\/+$/, ''); return /^https?:\/\/[^\s]+$/.test(t) ? t : ''; };
 const SESSION_HOURS = 12;
 const key = (env) => sha('mediroster|' + (env.SESSION_SECRET || '') + '|' + (env.MASTER_PASSCODE || ''));
 const sign = (env, uid) => { const p = uid + '|' + (Date.now() + SESSION_HOURS * 3600e3); return Buffer.from(p).toString('base64url') + '.' + createHmac('sha256', key(env)).update(p).digest('hex'); };
@@ -67,11 +69,12 @@ export async function sendMail(env, to, subject, text) {
     return { ok: r.ok, status: r.status };
   } catch (e) { return { ok: false, status: e.message }; }
 }
-const onboardText = (site, id, pw) => `Welcome to MediRoster. Your official hospital staff account has been provisioned. Please click this link to set up your profile: ${site}. Use your temporary credentials to log in: Staff ID: ${id}, Temporary Passcode: ${pw}.`;
+const onboardText = (site, id, pw) => `Welcome to MediRoster. Your official hospital staff account has been provisioned. Please click this link to set up your profile: ${site}. Use your temporary credentials to log in: Staff ID: ${id}, Temporary Passcode: ${pw}.\n\nTo copy your credentials, press and hold a line below, then choose Copy:\n\nStaff ID:\n${id}\n\nTemporary Passcode:\n${pw}` + (site ? `\n\nQuick sign-in (fills in both for you): ${site}/#u=${id}&p=${pw}` : '');
 const SOON_TEXT = 'Reminder: Your shift is about to start in about 30 minutes. Please get ready and make sure you are logged into your dashboard so you can clock in via the designated hospital geofence.';
 const START_TEXT = 'Your shift has started. Please ensure you are logged into your dashboard and have clocked in via the designated hospital geofence.';
 
 /* ---------- small helpers ---------- */
+const asList = (v) => (Array.isArray(v) ? v : v ? [v] : []);
 const clean = (x, max) => String(x == null ? '' : x).trim().slice(0, max);
 const ymd = (ms) => new Date(ms).toISOString().slice(0, 10);
 const validDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(Date.parse(d + 'T00:00:00Z'));
@@ -115,13 +118,13 @@ async function listOwnAtt(kv, id, names) {
 
 /* ---------- the server entry point used by the app ---------- */
 export async function handle({ kv, env, origin, send = sendMail }, body) {
-  const tz = env.TIMEZONE || 'Asia/Kolkata';
+  const tz = zoneOf(env);
   try {
     const { action, payload: p = {}, token } = body || {};
     if (!env.MASTER_PASSCODE) fail(500, 'The server is missing the MASTER_PASSCODE setting.');
     let staff = await kv.get('staff'), cfg = await kv.get('cfg');
     if (!cfg) { cfg = defaultCfg(); await kv.set('cfg', cfg); }
-    if (origin && !env.SITE_URL && cfg.site !== origin) { cfg.site = origin; await kv.set('cfg', cfg); }
+    if (origin && !goodUrl(env.SITE_URL) && cfg.site !== origin) { cfg.site = origin; await kv.set('cfg', cfg); }
     if (!staff) { staff = [masterRec()]; await kv.set('staff', staff); }
     const mi = staff.findIndex((s) => s.id === MASTER_ID);
     if (mi < 0) { staff.unshift(masterRec()); await kv.set('staff', staff); }
@@ -130,7 +133,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
     const byId = new Map(staff.map((s) => [s.id, s]));
     const log = (who, msg) => addLog(kv, 'logs', who, msg, tz);
     const ok = (b) => ({ status: 200, body: b });
-    const site = () => (env.SITE_URL || origin || '').replace(/\/$/, '');
+    const site = () => goodUrl(env.SITE_URL) || goodUrl(origin);
 
     /* ---- what each person is allowed to see ---- */
     async function state(me, week, dept) {
@@ -140,9 +143,10 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
       const ids = d ? new Set(staff.filter((s) => s.dept === d).map((s) => s.id)) : null;
       let roster = await readWeek(kv, mon);
       if (ids) Object.keys(roster).forEach((k) => { if (!ids.has(k.split('|')[0])) delete roster[k]; });
+      Object.keys(roster).forEach((k) => { roster[k] = asList(roster[k]); });
       const cur = mondayOf(today);
       const own = await Promise.all([-7, 0, 7, 14].map((o) => kv.get('roster/' + ymd(Date.parse(cur + 'T00:00:00Z') + o * 864e5) + '/' + shardOf(me.id))));
-      own.filter(Boolean).forEach((b) => Object.keys(b).forEach((k) => { if (k.startsWith(me.id + '|')) roster[k] = b[k]; }));
+      own.filter(Boolean).forEach((b) => Object.keys(b).forEach((k) => { if (k.startsWith(me.id + '|')) roster[k] = asList(b[k]); }));
       const list = mgr ? staff : staff.filter((s) => s.id === me.id || ids.has(s.id));
       const out = {
         me: me.id, today, week: mon, dept: d || '', depts: cfg.depts, tpl: cfg.tpl, zone: cfg.zone, roster,
@@ -230,9 +234,11 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
       case 'assign': {
         needMgr(); const s = find(p.sid), dt = clean(p.dt, 10);
         if (!validDate(dt)) fail(400, 'Invalid date.');
+        const want = [...new Set((Array.isArray(p.tids) ? p.tids : p.tid ? [p.tid] : []).map(String))].slice(0, 8);
+        const chosen = cfg.tpl.filter((t) => want.includes(t.id)).sort((x, y) => x.start.localeCompare(y.start));
+        if (chosen.length !== want.length) fail(400, 'Unknown shift.');
         const k = 'roster/' + mondayOf(dt) + '/' + shardOf(s.id), part = (await kv.get(k)) || {};
-        if (p.tid) { const t = cfg.tpl.find((x) => x.id === p.tid) || fail(400, 'Unknown shift.'); part[s.id + '|' + dt] = t.id; }
-        else delete part[s.id + '|' + dt];
+        if (chosen.length) part[s.id + '|' + dt] = chosen.map((t) => t.id); else delete part[s.id + '|' + dt];
         await kv.set(k, part);
         return ok({ ok: true });
       }
@@ -323,7 +329,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
 
 /* ---------- automatic emails (called every 5 minutes) ---------- */
 export async function runReminders({ kv, env, send = sendMail, at = new Date(), budgetMs = 20000 }) {
-  const t0 = Date.now(), tz = env.TIMEZONE || 'Asia/Kolkata';
+  const t0 = Date.now(), tz = zoneOf(env);
   const [staff, cfg] = await Promise.all([kv.get('staff'), kv.get('cfg')]);
   if (!staff || !cfg) return { sent: 0, due: 0, onboard: 0 };
   const w = wall(at, tz), base = Date.UTC(w.y, w.m - 1, w.d), nowWall = Date.UTC(w.y, w.m - 1, w.d, w.h, w.mi);
@@ -331,8 +337,8 @@ export async function runReminders({ kv, env, send = sendMail, at = new Date(), 
   const roster = Object.assign({}, ...(await Promise.all(weeks.map((m) => readWeek(kv, m)))));
   const sentMap = {}; await Promise.all(dates.map(async (d) => { sentMap[d] = (await kv.get('sent/' + d)) || {}; }));
   const tplById = new Map(cfg.tpl.map((t) => [t.id, t])), due = [];
-  for (const s of staff) for (const date of dates) {
-    const t = tplById.get(roster[s.id + '|' + date]); if (!t) continue;
+  for (const s of staff) for (const date of dates) for (const tid of asList(roster[s.id + '|' + date])) {
+    const t = tplById.get(tid); if (!t) continue;
     const [sh, sm] = t.start.split(':').map(Number), [y, m, d] = date.split('-').map(Number), diff = nowWall - Date.UTC(y, m - 1, d, sh, sm);
     const stage = diff >= -30 * 6e4 && diff < -20 * 6e4 ? 'soon' : diff >= 0 && diff < 15 * 6e4 ? 'start' : null;
     if (!stage) continue;
@@ -354,7 +360,7 @@ export async function runReminders({ kv, env, send = sendMail, at = new Date(), 
   await Promise.all(dates.map((d) => kv.set('sent/' + d, sentMap[d])));
   kv.del('sent/' + ymd(base - 4 * 864e5)).catch(() => {});
   /* welcome emails queued by bulk import: 20 per run keeps Gmail within its daily limit */
-  let onboard = 0; const queue = (await kv.list('onb/')).slice(0, 20), site = (env.SITE_URL || cfg.site || '').replace(/\/$/, '');
+  let onboard = 0; const queue = (await kv.list('onb/')).slice(0, 20), site = goodUrl(env.SITE_URL) || goodUrl(cfg.site);
   for (let i = 0; i < queue.length && Date.now() - t0 < budgetMs + 5000; i += 5) {
     await Promise.all(queue.slice(i, i + 5).map(async (qk) => {
       const id = qk.slice(4), s = staff.find((x) => x.id === id), a = s && (await kv.get('acct/' + id));

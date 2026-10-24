@@ -107,27 +107,33 @@ function view(){switch(tab){
 
 /* ---------- ROSTER GRID ---------- */
 function legend(){return `<div class="flex flex-wrap gap-2 text-xs">${db.tpl.map(t=>`<span class="px-2 py-1 rounded-md font-semibold" style="background:${t.color}22;color:${t.color};border:1px solid ${t.color}55">${esc(t.name)} ${t.start}–${t.end}</span>`).join('')}</div>`}
+function shifts(sid,dt){const v=db.roster[sid+'|'+dt];return (Array.isArray(v)?v:v?[v]:[]).map(tplOf).filter(Boolean)}
 function rosterView(edit){
  const days=[...Array(7)].map((_,i)=>addDays(ws,i)),groups=rdept?[rdept]:[...db.depts];
  if(!rdept&&db.staff.some(s=>!db.depts.includes(s.dept)))groups.push('Unassigned');
- let h=`<div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="text-xl font-bold">${edit?'Roster Planner':'General Roster'}</h2><p class="text-sm text-slate-500">${edit?'Tap any cell to assign or clear a shift. No automatic checks are applied.':'Read-only facility schedule.'}</p></div>
+ let h=`<div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="text-xl font-bold">${edit?'Roster Planner':'General Roster'}</h2><p class="text-sm text-slate-500">${edit?'Tap any cell to choose one or more shifts for that day. No automatic checks are applied.':'Read-only facility schedule.'}</p></div>
  <div class="flex flex-wrap items-center gap-2"><select class="inp !w-auto" onchange="setDept(this.value)">${isMgr()?`<option value="">All departments</option>`:''}${db.depts.map(d=>`<option ${d===rdept?'selected':''}>${esc(d)}</option>`).join('')}</select><button class="btn2" onclick="go(-7)">‹ Prev</button><button class="btn2" onclick="goToday()">This week</button><button class="btn2" onclick="go(7)">Next ›</button><button class="btn2 noprint" onclick="window.print()">Print</button></div></div>${legend()}
  <div class="card overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 text-slate-600"><th class="text-left p-3 sticky left-0 bg-slate-50 min-w-[170px]">Staff</th>${days.map(d=>`<th class="p-2 text-center min-w-[104px] ${iso(d)===today()?'text-blue-700':''}">${d.toLocaleDateString('en-GB',{weekday:'short'})}<div class="font-normal text-xs">${d.getDate()} ${d.toLocaleDateString('en-GB',{month:'short'})}</div></th>`).join('')}</tr></thead><tbody>`;
  groups.forEach(g=>{const ppl=db.staff.filter(s=>g==='Unassigned'?!db.depts.includes(s.dept):s.dept===g);if(!ppl.length)return;
   h+=`<tr class="bg-slate-100"><td colspan="8" class="px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-slate-600">${esc(g)}</td></tr>`;
   ppl.forEach(s=>{h+=`<tr class="border-t border-slate-100 ${s.id===user.id?'bg-blue-50/60':''}"><td class="p-2 sticky left-0 ${s.id===user.id?'bg-blue-50':'bg-white'}"><div class="font-semibold">${esc(s.name)}${bdg(s)}</div><div class="text-xs text-slate-500">${s.id}</div></td>`+
-   days.map(d=>{const dt=iso(d),t=tplOf(db.roster[s.id+'|'+dt]);
-    const inner=t?`<div class="rounded-lg px-1 py-1.5 text-center text-xs font-bold" style="background:${t.color}22;color:${t.color};border:1px solid ${t.color}55">${esc(t.name)}<div class="font-normal">${t.start}–${t.end}</div></div>`:`<div class="rounded-lg py-3 text-center text-slate-300 ${edit?'border border-dashed border-slate-300':''}">${edit?'+':'–'}</div>`;
+   days.map(d=>{const dt=iso(d),L=shifts(s.id,dt);
+    const inner=L.length?L.map(t=>`<div class="rounded-lg px-1 py-1 mb-1 text-center text-xs font-bold" style="background:${t.color}22;color:${t.color};border:1px solid ${t.color}55">${esc(t.name)}<div class="font-normal">${t.start}–${t.end}</div></div>`).join(''):`<div class="rounded-lg py-3 text-center text-slate-300 ${edit?'border border-dashed border-slate-300':''}">${edit?'+':'–'}</div>`;
     return `<td class="p-1">${edit?`<button class="w-full" onclick="pick(event,'${s.id}','${dt}')">${inner}</button>`:inner}</td>`}).join('')+'</tr>'});});
  return h+`</tbody><tfoot><tr class="border-t-2 border-slate-300 bg-slate-50 text-xs font-semibold text-slate-600"><td class="p-2 sticky left-0 bg-slate-50">Staff on duty</td>${days.map(d=>`<td class="p-2 text-center">${db.staff.filter(s=>db.roster[s.id+'|'+iso(d)]).length}</td>`).join('')}</tr></tfoot></table></div>`}
-function pick(e,sid,dt){e.stopPropagation();if(!isMgr())return;const r=e.currentTarget.getBoundingClientRect(),p=document.getElementById('pop'),s=db.staff.find(x=>x.id===sid);
- p.innerHTML=`<div class="text-xs text-slate-500 px-2 pb-1">${esc(s.name)} · ${fmtD(dt)}</div>`+db.tpl.map(t=>`<button onclick="assign('${sid}','${dt}','${t.id}')" class="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-semibold" style="color:${t.color}">${esc(t.name)} <span class="font-normal text-slate-500">${t.start}–${t.end}</span></button>`).join('')+`<button onclick="assign('${sid}','${dt}',null)" class="w-full text-left px-3 py-2 rounded-lg hover:bg-red-50 text-sm font-semibold text-red-700 border-t border-slate-200 mt-1">Clear shift</button>`;
- p.classList.remove('hidden');p.style.left=Math.max(8,Math.min(r.left,innerWidth-232))+'px';p.style.top=Math.max(8,Math.min(r.bottom+4,innerHeight-p.offsetHeight-8))+'px'}
+let popFor=null;
+function pick(e,sid,dt){e.stopPropagation();if(!isMgr())return;const r=e.currentTarget.getBoundingClientRect();popFor={sid,dt,left:r.left,bottom:r.bottom};drawPop()}
+function drawPop(){const p=document.getElementById('pop');if(!popFor)return;const {sid,dt}=popFor,s=db.staff.find(x=>x.id===sid),on=new Set(shifts(sid,dt).map(t=>t.id));
+ p.innerHTML=`<div class="text-xs text-slate-500 px-2 pb-1">${esc(s.name)} · ${fmtD(dt)}<br>Tick every shift this person works that day</div>`+db.tpl.map(t=>`<button onclick="toggleShift('${t.id}')" class="w-full flex items-center gap-2 text-left px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-semibold" style="color:${t.color}"><span class="inline-block w-4 text-center">${on.has(t.id)?'☑':'☐'}</span><span>${esc(t.name)} <span class="font-normal text-slate-500">${t.start}–${t.end}</span></span></button>`).join('')+`<div class="flex gap-2 border-t border-slate-200 mt-1 pt-1"><button onclick="clearShifts()" class="grow text-left px-3 py-2 rounded-lg hover:bg-red-50 text-sm font-semibold text-red-700">Clear all</button><button onclick="closePop()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold">Done</button></div>`;
+ p.classList.remove('hidden');p.style.left=Math.max(8,Math.min(popFor.left,innerWidth-232))+'px';p.style.top=Math.max(8,Math.min(popFor.bottom+4,innerHeight-p.offsetHeight-8))+'px'}
+function closePop(){popFor=null;document.getElementById('pop').classList.add('hidden')}
+async function toggleShift(tid){const {sid,dt}=popFor,cur=shifts(sid,dt).map(t=>t.id),next=cur.includes(tid)?cur.filter(x=>x!==tid):[...cur,tid];next.sort((a,b)=>tplOf(a).start.localeCompare(tplOf(b).start));await setShifts(sid,dt,next)}
+async function clearShifts(){await setShifts(popFor.sid,popFor.dt,[])}
+async function setShifts(sid,dt,tids){try{await api('assign',{sid,dt,tids});const k=sid+'|'+dt;if(tids.length)db.roster[k]=tids;else delete db.roster[k];render();drawPop()}catch(e){}}
 document.addEventListener('click',e=>{const p=document.getElementById('pop');if(!p.contains(e.target))p.classList.add('hidden')});
-async function assign(sid,dt,tid){document.getElementById('pop').classList.add('hidden');try{await api('assign',{sid,dt,tid});const k=sid+'|'+dt;if(tid)db.roster[k]=tid;else delete db.roster[k];render()}catch(e){}}
-function mine(){const items=[];for(let d=0;d<14;d++){const dt=iso(addDays(new Date(today()+'T00:00'),d));items.push({dt,t:tplOf(db.roster[user.id+'|'+dt]),d})}
+function mine(){const items=[];for(let d=0;d<14;d++){const dt=iso(addDays(new Date(today()+'T00:00'),d));items.push({dt,L:shifts(user.id,dt),d})}
  return `<div><h2 class="text-xl font-bold">My Personal Roster${bdg(user)}</h2><p class="text-sm text-slate-500">Your assigned shifts for the next 14 days.</p></div><div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">`+
- items.map(i=>`<div class="card p-4 ${i.d===0?'ring-2 ring-blue-600':''}"><div class="text-sm text-slate-500">${fmtD(i.dt)}${i.d===0?' · Today':''}</div>${i.t?`<div class="text-lg font-bold mt-1" style="color:${i.t.color}">${esc(i.t.name)} Shift</div><div class="text-slate-600">${i.t.start} – ${i.t.end}</div>`:'<div class="text-slate-400 mt-1">Day off</div>'}</div>`).join('')+'</div>'}
+ items.map(i=>`<div class="card p-4 ${i.d===0?'ring-2 ring-blue-600':''}"><div class="text-sm text-slate-500">${fmtD(i.dt)}${i.d===0?' · Today':''}</div>${i.L.length?i.L.map(t=>`<div class="mt-1"><span class="text-lg font-bold" style="color:${t.color}">${esc(t.name)} Shift</span> <span class="text-slate-600">${t.start} – ${t.end}</span></div>`).join(''):'<div class="text-slate-400 mt-1">Day off</div>'}</div>`).join('')+'</div>'}
 
 /* ---------- STAFF (master) ---------- */
 function staffRows(){const q=sq.toLowerCase(),all=db.staff.filter(s=>!q||(s.name+' '+s.id+' '+(s.email||'')+' '+(s.designation||'')+' '+s.dept).toLowerCase().includes(q)),pages=Math.max(1,Math.ceil(all.length/25));if(spage>=pages)spage=pages-1;if(spage<0)spage=0;return {all,pages,rows:all.slice(spage*25,spage*25+25)}}
@@ -185,10 +191,10 @@ function checkLoc(){const z=db.zone;loc.status='loading';
  if(!navigator.geolocation){loc.status='err';loc.msg='Location is not supported in this browser.';return render()}
  navigator.geolocation.getCurrentPosition(p=>{loc.lat=p.coords.latitude;loc.lng=p.coords.longitude;loc.d=Math.round(dist(loc.lat,loc.lng,z.lat,z.lng));loc.status='ok';if(tab==='attend')render()},e=>{loc.status='err';loc.msg='Could not read your location ('+e.message+'). Allow location access in your browser and try again.';if(tab==='attend')render()},{enableHighAccuracy:true,timeout:10000})}
 function setMode(m){loc={mode:m,status:'idle'};render()}
-function clockView(){const z=db.zone,inZ=loc.status==='ok'&&loc.d<=z.radius,rec=db.att.find(a=>a.id===user.id&&a.date===today()),t=tplOf(db.roster[user.id+'|'+today()]);
+function clockView(){const z=db.zone,inZ=loc.status==='ok'&&loc.d<=z.radius,rec=db.att.find(a=>a.id===user.id&&a.date===today()),t=shifts(user.id,today());
  return `<h2 class="text-xl font-bold">Geofenced Attendance</h2>
  <div class="card p-5 space-y-4"><div class="flex flex-wrap justify-between gap-3"><div><div class="text-sm text-slate-500">Designated zone</div><div class="font-semibold">${esc(z.name)} · ${z.radius} m radius</div></div>
-  <div><div class="text-sm text-slate-500">Today</div><div class="font-semibold">${t?esc(t.name)+' Shift '+t.start+'–'+t.end:'No shift assigned'}</div></div>
+  <div><div class="text-sm text-slate-500">Today</div><div class="font-semibold">${t.length?t.map(x=>esc(x.name)+' '+x.start+'–'+x.end).join(', '):'No shift assigned'}</div></div>
   </div>
   <div class="text-center py-4">${rec?`<div class="inline-block rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-800 px-8 py-6"><div class="text-2xl font-bold">✓ Clocked in at ${rec.time}</div><div class="text-sm">Attendance recorded for today.</div></div>`:
   `<button ${inZ?'':'disabled'} onclick="clockIn()" class="rounded-2xl px-10 py-8 text-2xl font-bold text-white ${inZ?'bg-emerald-600 hover:bg-emerald-700':'bg-slate-400 cursor-not-allowed'}">${loc.status==='loading'?'Locating…':inZ?'Tap to Clock In':'Clock In Locked'}</button>`}
@@ -221,13 +227,15 @@ function enableAlerts(){if(!('Notification' in window))return toast('Device aler
 function inApp(msg){putNotes([{msg,t:new Date().toLocaleString('en-GB'),read:false},...notes()]);fire(msg);updBadge()}
 /* In-app banner for the signed-in person's own shift start (emails are sent by the server). */
 function tick(){if(!user||!db)return;const n=Date.now();
- for(let d=-1;d<=0;d++){const dt=iso(addDays(new Date(),d)),t=tplOf(db.roster[user.id+'|'+dt]);if(!t)continue;
+ for(let d=-1;d<=0;d++){const dt=iso(addDays(new Date(),d));for(const t of shifts(user.id,dt)){
   const diff=n-new Date(dt+'T'+t.start).getTime();if(diff<0||diff>6e5)continue;
-  const key='mr_seen_'+user.id+'|'+dt+'|'+t.id;try{if(localStorage.getItem(key))continue;localStorage.setItem(key,'1')}catch(e){continue}inApp(SHIFT_MSG)}}
+  const key='mr_seen_'+user.id+'|'+dt+'|'+t.id;try{if(localStorage.getItem(key))continue;localStorage.setItem(key,'1')}catch(e){continue}inApp(SHIFT_MSG)}}}
 function startPolling(){clearInterval(poll);clearInterval(tk);poll=setInterval(softRefresh,300000);tk=setInterval(tick,30000);
  if(!vis){vis=true;document.addEventListener('visibilitychange',()=>{if(!document.hidden&&Date.now()-lastFetch>120000)softRefresh()})}}
 async function softRefresh(){if(!user||document.hidden)return;const f=document.activeElement;if(f&&/INPUT|SELECT|TEXTAREA/.test(f.tagName))return;
  const before=JSON.stringify(db);try{await api('state',{},1);if(JSON.stringify(db)!==before)render()}catch(e){}}
-async function boot(){if(!token)return loginView();try{await api('state',{},1);await enter()}catch(e){token=null;loginView()}}
+function prefill(){const m=/^#u=([A-Za-z0-9-]+)&p=([A-Za-z0-9]+)$/.exec(location.hash||'');if(!m)return;const a=document.getElementById('lid'),b=document.getElementById('lpw');
+ if(a&&b){a.value=m[1];b.value=m[2];toast('Your Staff ID and temporary passcode are filled in. Press Sign In.')}try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}}
+async function boot(){if(!token){loginView();prefill();return}try{await api('state',{},1);await enter()}catch(e){token=null;loginView();prefill()}}
 boot();
 </script></body></html>
