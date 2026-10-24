@@ -16,7 +16,7 @@ const iso=d=>{d=new Date(d);return d.getFullYear()+'-'+String(d.getMonth()+1).pa
 const addDays=(d,n)=>{d=new Date(d);d.setDate(d.getDate()+n);return d};
 const fmtD=d=>new Date(d+'T00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
 const monday=d=>{d=new Date(d);d.setHours(0,0,0,0);d.setDate(d.getDate()-((d.getDay()+6)%7));return d};
-let db=null,user=null,token=null,screen='login',setupUser=null,note=null,tab=null,ws=monday(new Date()),loc={mode:'gps',status:'idle'},bell=false,poll=null,tk=null,vis=false,rdept='',sq='',spage=0,stat={},attDate='',attRows=null,lastFetch=0;
+let db=null,user=null,token=null,screen='login',setupUser=null,note=null,tab=null,ws=monday(new Date()),loc={mode:'gps',status:'idle'},bell=false,chat=[],chatBusy=false,lastUndo=null,imp={step:'start',mode:'set',busy:false,msg:'',fileName:'',proposed:[],problems:[],preview:null},poll=null,tk=null,vis=false,rdept='',sq='',spage=0,stat={},attDate='',attRows=null,lastFetch=0;
 try{token=localStorage.getItem(TK)}catch(e){}
 async function api(action,payload,quiet){
  try{const r=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,payload:{week:iso(ws),dept:rdept,...(payload||{})},token})});
@@ -76,8 +76,8 @@ function forgotView(msg){authShell(`<div><h2 class="text-2xl font-bold">Forgot P
 async function doForgot(e){e.preventDefault();const id=$v('fid').trim().toUpperCase();if(!id)return lerr('Enter your Staff ID.');
  try{const j=await api('forgot',{id},1);forgotView(j.master?'The Master Admin account cannot be reset online.':'Your reset request has been logged. For security verification, you cannot log in until a System Admin or Master Admin manually reviews and approves your request.')}catch(x){lerr(x.message)}return false}
 /* ---------- SHELL ---------- */
-function tabsFor(r){return r==='master'?[['roster','Roster'],['staff','Staff'],['depts','Departments'],['shifts','Shift Templates'],['attend','Attendance &amp; Zone'],['logs','System Logs']]
- :r==='admin'?[['roster','Roster'],['attend','Attendance']]:[['mine','Personal Roster'],['general','General Roster'],['attend','Clock In']]}
+function tabsFor(r){return r==='master'?[['roster','Roster'],['assistant','AI Assistant'],['import','Import Roster'],['staff','Staff'],['depts','Departments'],['shifts','Shift Templates'],['attend','Attendance &amp; Zone'],['logs','System Logs']]
+ :r==='admin'?[['roster','Roster'],['assistant','AI Assistant'],['import','Import Roster'],['attend','Attendance']]:[['mine','Personal Roster'],['general','General Roster'],['attend','Clock In']]}
 function pendingHTML(){const p=db.pending||[];if(!p.length)return '';
  return `<div class="rounded-xl border-2 border-red-300 bg-red-50 p-4"><div class="font-bold text-red-800">⚠ Pending Approvals (${p.length})</div><div class="text-sm text-red-700">These staff cannot sign in until a passcode reset is approved.</div>`+
  p.map(s=>`<div class="flex flex-wrap items-center justify-between gap-2 bg-white rounded-lg border border-red-200 p-3 mt-2"><div><span class="font-semibold">${esc(s.name)}</span> <span class="font-mono text-sm text-slate-500">${s.id}</span><div class="text-xs text-slate-500">Requested ${esc(s.resetAt||'')}</div></div><button class="btn" onclick="approve('${s.id}')">Approve &amp; Issue Temporary Passcode</button></div>`).join('')+'</div>'}
@@ -99,10 +99,11 @@ function render(){
   <main class="p-4 lg:p-6 max-w-7xl mx-auto space-y-4">${user.role==='master'?statusHTML():''}${isMgr()?pendingHTML()+noteHTML():''}${view()}</main>`;
  if(tab==='attend'&&user.role==='worker'&&loc.status==='idle')checkLoc();
  if(tab==='staff'&&user.role==='master')loadStatus();
+ if(tab==='assistant'){const c=document.getElementById('chatbox');if(c)c.scrollTop=c.scrollHeight}
 }
 function view(){switch(tab){
  case'roster':return rosterView(isMgr());case'general':return rosterView(false);case'mine':return mine();
- case'staff':return staffView();case'depts':return deptView();case'shifts':return shiftView();
+ case'staff':return staffView();case'assistant':return assistantView();case'import':return importView();case'depts':return deptView();case'shifts':return shiftView();
  case'attend':return user.role==='worker'?clockView():attendAdmin();case'logs':return logView()}return ''}
 
 /* ---------- ROSTER GRID ---------- */
@@ -210,6 +211,140 @@ function attendAdmin(){const z=db.zone,m=user.role==='master';
  <button class="btn" onclick="saveZone()">Save zone</button><button class="btn2" onclick="useHere()">Use my current location</button></div>`:'')+attPicker()+histTable(attRows||db.att,'Clock-ins on '+(attDate||today()))}
 async function saveZone(){try{await api('saveZone',{name:$v('zn'),lat:$v('zla'),lng:$v('zlo'),radius:$v('zr')});toast('Zone saved.');render()}catch(e){}}
 function useHere(){if(!navigator.geolocation)return toast('Geolocation unavailable here.');navigator.geolocation.getCurrentPosition(p=>{document.getElementById('zla').value=p.coords.latitude.toFixed(6);document.getElementById('zlo').value=p.coords.longitude.toFixed(6);toast('Coordinates filled. Press Save zone.')},e=>toast('GPS blocked: '+e.message+'. Type coordinates manually.'),{timeout:8000})}
+
+/* ---------- AI ASSISTANT ---------- */
+const EXAMPLES=['Assign [name] to the Morning shift for the next 7 days','Give [name] Morning and Evening shifts next Monday','Clear all shifts for [name] this week','Put everyone in ICU on Night shift on weekdays next week'];
+function previewHTML(pv,max){if(!pv)return '';const rows=(pv.sample||[]).slice(0,max||60);
+ return `<div class="text-sm font-semibold">${pv.total} change${pv.total===1?'':'s'} for ${pv.people} ${pv.people===1?'person':'people'}${pv.from?` (${fmtD(pv.from)} to ${fmtD(pv.to)})`:''}${pv.noop?` · ${pv.noop} already as requested`:''}</div>`+
+ (rows.length?`<div class="overflow-x-auto mt-2"><table class="w-full text-xs"><thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">Staff</th><th class="pr-3">Date</th><th class="pr-3">Now</th><th>After</th></tr></thead><tbody>${rows.map(r=>`<tr class="border-t border-slate-100"><td class="py-1 pr-3">${esc(r.name)}</td><td class="pr-3 whitespace-nowrap">${fmtD(r.dt)}</td><td class="pr-3 text-slate-500">${r.before.length?esc(r.before.join(' + ')):'none'}</td><td class="font-semibold">${r.after.length?esc(r.after.join(' + ')):'day off'}</td></tr>`).join('')}</tbody></table></div>`:'')+
+ (pv.total>rows.length?`<div class="text-xs text-slate-500 mt-1">...and ${pv.total-rows.length} more</div>`:'')+
+ ((pv.problems||[]).length?`<div class="mt-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2"><b>Skipped or unclear:</b><br>${pv.problems.map(esc).join('<br>')}${pv.moreProblems?`<br>...and ${pv.moreProblems} more`:''}</div>`:'')}
+function assistantView(){
+ const msgs=chat.map((m,i)=>m.role==='user'?`<div class="flex justify-end"><div class="max-w-[85%] rounded-2xl bg-blue-700 text-white px-4 py-2 text-sm">${esc(m.text)}</div></div>`
+  :`<div class="flex"><div class="max-w-[95%] rounded-2xl bg-white border border-slate-200 px-4 py-3 text-sm space-y-2"><div>${esc(m.text)}</div>${m.plan?previewHTML(m.plan.preview,40):''}${m.plan&&m.plan.preview.total&&!m.plan.state?`<div class="flex gap-2 pt-1"><button class="btn" onclick="aiConfirm(${i})">Confirm and save ${m.plan.preview.total} change${m.plan.preview.total===1?'':'s'}</button><button class="btn2" onclick="aiCancel(${i})">Cancel</button></div>`:''}${m.plan&&m.plan.state==='saving'?'<div class="text-xs text-slate-500">Saving...</div>':''}${m.plan&&m.plan.state==='done'?'<div class="text-xs text-emerald-700 font-semibold">Saved.</div>':''}${m.plan&&m.plan.state==='cancelled'?'<div class="text-xs text-slate-500">Cancelled. Nothing was saved.</div>':''}</div></div>`).join('');
+ return `<h2 class="text-xl font-bold">AI Assistant</h2><p class="text-sm text-slate-500">Tell me what to change in plain English. I show you exactly what will change, and nothing is saved until you press Confirm.</p>
+ ${db.ai?'':'<div class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm">The AI is not switched on yet. The Master Admin needs to add the AI_API_KEY setting in Netlify (see the guide, Part F).</div>'}
+ <div id="chatbox" class="card p-4 space-y-3 overflow-y-auto" style="max-height:55vh;min-height:180px">${msgs||'<div class="text-sm text-slate-500">Try an example below (replace [name] with a real name), or type your own request.</div>'}${chatBusy?'<div class="text-sm text-slate-500">Thinking...</div>':''}</div>
+ <div class="flex flex-wrap gap-2">${EXAMPLES.map((x,i)=>`<button class="btn2 text-xs" onclick="useExample(${i})">${esc(x)}</button>`).join('')}</div>
+ <div class="card p-3 flex gap-2 items-end"><textarea id="aiq" rows="2" class="inp" placeholder="e.g. Assign Anita Rao to the Morning shift for the next 7 days" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();aiSend()}"></textarea><button class="btn" ${chatBusy?'disabled':''} onclick="aiSend()">Send</button></div>
+ ${lastUndo?`<div><button class="btn2" onclick="aiUndo()">Undo the last saved change (${lastUndo.length} day${lastUndo.length===1?'':'s'})</button></div>`:''}`}
+function useExample(i){const q=document.getElementById('aiq');q.value=EXAMPLES[i];if(q.focus)q.focus()}
+async function aiSend(){const q=document.getElementById('aiq'),text=((q&&q.value)||'').trim();if(!text||chatBusy)return;
+ const hist=chat.slice(-6).map(m=>({role:m.role,text:m.text}));chat.push({role:'user',text});chatBusy=true;render();
+ try{const j=await api('aiPlan',{message:text,history:hist},1);chat.push({role:'ai',text:j.reply||'(no reply)',plan:j.preview?{preview:j.preview,changes:j.changes,note:text}:null})}
+ catch(e){chat.push({role:'ai',text:'Sorry: '+e.message})}
+ chatBusy=false;render()}
+async function aiConfirm(i){const m=chat[i];if(!m||!m.plan||m.plan.state)return;m.plan.state='saving';render();
+ try{const j=await api('applyChanges',{changes:m.plan.changes,source:'ai',note:m.plan.note},1);m.plan.state='done';lastUndo=j.undo&&j.undo.length?j.undo:null;chat.push({role:'ai',text:`Done. ${j.applied} day${j.applied===1?'':'s'} updated and recorded in the System Logs. The Roster tab now shows it.`})}
+ catch(e){m.plan.state=null;chat.push({role:'ai',text:'Could not save: '+e.message})}render()}
+function aiCancel(i){if(chat[i]&&chat[i].plan)chat[i].plan.state='cancelled';render()}
+async function aiUndo(){if(!lastUndo||!confirm('Put the roster back the way it was before the last change?'))return;
+ try{await api('applyChanges',{changes:lastUndo,source:'undo',note:'Undo'},1);lastUndo=null;chat.push({role:'ai',text:'Undone. The roster is back the way it was.'})}catch(e){chat.push({role:'ai',text:'Could not undo: '+e.message})}render()}
+
+/* ---------- IMPORT ROSTER (Excel, CSV, PDF or pasted text) ---------- */
+const XLSX_URL='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',PDF_URL='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',PDF_WORKER='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const loadedJS={};
+function loadScript(u){return loadedJS[u]||(loadedJS[u]=new Promise((res,rej)=>{const s=document.createElement('script');s.src=u;s.onload=res;s.onerror=()=>{delete loadedJS[u];rej(new Error('Could not load a helper tool. Check your internet, or save the file as CSV / paste the table instead.'))};document.head.appendChild(s)}))}
+function gptPrompt(){const dates=[...Array(7)].map((_,i)=>iso(addDays(ws,i)));return `Create a roster as a plain CSV table (no explanations, no markdown). Header row: Staff ID,Name,${dates.join(',')}\nOne row per staff member from the list I give you. Each cell holds shift names exactly as spelled here: ${db.tpl.map(t=>t.name).join(', ')}. Use + between two shifts on the same day (for example ${db.tpl[0]?db.tpl[0].name:'Morning'}+${db.tpl[1]?db.tpl[1].name:'Evening'}), write OFF for a day off, and leave a cell empty for no change.\nMy rules: [WRITE YOUR RULES HERE, for example: 2 nurses on every shift, nobody works more than 5 days in a row]\nMy staff (Staff ID, Name): [PASTE THE STAFF ID AND NAME COLUMNS FROM THE DOWNLOADED TEMPLATE HERE]`}
+function copyPrompt(){const t=document.getElementById('gptPrompt');t.select();const ok=()=>toast('Copied.');try{navigator.clipboard.writeText(t.value).then(ok,()=>{document.execCommand('copy');ok()})}catch(e){document.execCommand('copy');ok()}}
+function csvOut(rows){return rows.map(r=>r.map(x=>'"'+String(x).replace(/"/g,'""')+'"').join(',')).join('\n')}
+function downloadCSV(rows,name){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+csvOut(rows)],{type:'text/csv'}));a.download=name;a.click()}
+function downloadTemplate(){const dates=[...Array(7)].map((_,i)=>iso(addDays(ws,i))),list=db.staff.filter(s=>s.role!=='master'&&(!rdept||s.dept===rdept)).slice(0,2000);
+ downloadCSV([['Staff ID','Name',...dates],...list.map(s=>[s.id,s.name,...dates.map(()=>'')])],'mediroster-roster-template.csv')}
+function importView(){if(imp.step==='preview')return importPreviewView();
+ return `<h2 class="text-xl font-bold">Import Roster</h2><p class="text-sm text-slate-500">Upload a roster from Excel, CSV or PDF, or paste a table (for example one made by ChatGPT). You see exactly what will change before anything is saved.</p>
+ ${imp.msg?`<div class="rounded-lg border border-slate-300 bg-white p-3 text-sm">${esc(imp.msg)}</div>`:''}
+ <div class="card p-4 space-y-2"><div class="font-bold">1. Get the fill-in template</div><div class="text-sm text-slate-500">A spreadsheet with your staff down the side and the dates shown on the Roster tab across the top (${esc(rdept||'all departments')}). Fill each cell with a shift name. Use + for two shifts (Morning+Evening), OFF for a day off, and leave a cell empty for no change.</div><button class="btn2" onclick="downloadTemplate()">Download template (CSV, opens in Excel)</button></div>
+ <div class="card p-4 space-y-2"><div class="font-bold">2. Upload your filled roster, or paste it</div>
+  <div class="flex flex-wrap gap-3 items-end"><input id="impFile" type="file" accept=".xlsx,.xls,.csv,.txt,.pdf" class="text-sm"><div><label class="text-xs font-semibold">Week starting (only needed if the columns say Mon, Tue... without dates)</label><input id="impWeek" type="date" class="inp" value="${iso(ws)}"></div></div>
+  <textarea id="impText" rows="5" class="inp text-sm font-mono" placeholder="...or paste the table here"></textarea>
+  <div class="flex flex-wrap items-center gap-4 text-sm"><label><input type="radio" name="impMode" value="set" ${imp.mode==='set'?'checked':''} onchange="imp.mode='set'"> Replace that day's shifts (recommended)</label><label><input type="radio" name="impMode" value="add" ${imp.mode==='add'?'checked':''} onchange="imp.mode='add'"> Add to existing shifts</label></div>
+  <button class="btn" ${imp.busy?'disabled':''} onclick="importRead()">${imp.busy?'Reading...':'Read roster and show preview'}</button></div>
+ <div class="card p-4 space-y-2"><div class="font-bold">Using ChatGPT? Copy this request</div><textarea readonly rows="7" class="inp text-xs font-mono" id="gptPrompt">${esc(gptPrompt())}</textarea><button class="btn2" onclick="copyPrompt()">Copy request</button></div>
+ ${lastUndo?`<div><button class="btn2" onclick="aiUndo()">Undo the last saved change (${lastUndo.length} day${lastUndo.length===1?'':'s'})</button></div>`:''}`}
+function importPreviewView(){const pv=imp.preview;return `<h2 class="text-xl font-bold">Check before saving</h2><p class="text-sm text-slate-500">Source: ${esc(imp.fileName)}. Nothing has been saved yet.</p><div class="card p-4">${previewHTML(pv,200)}</div>`+
+ (pv.total?`<div class="flex gap-2"><button class="btn" ${imp.busy?'disabled':''} onclick="importConfirm()">${imp.busy?'Saving...':'Confirm and save '+pv.total+' change'+(pv.total===1?'':'s')}</button><button class="btn2" onclick="importCancel()">Cancel</button></div>`:'<div class="text-sm">Nothing would change.</div><button class="btn2" onclick="importCancel()">Back</button>')+(imp.msg?`<div class="text-sm">${esc(imp.msg)}</div>`:'')}
+const nameKey=x=>String(x||'').toLowerCase().replace(/\b(dr|mr|mrs|ms|prof)\b\.?/g,' ').replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
+function staffIndex(){const byName={},byId={};db.staff.forEach(s=>{byId[s.id.toUpperCase()]=s;const k=nameKey(s.name);(byName[k]=byName[k]||[]).push(s)});return {byName,byId}}
+function findStaff(q,ix){const raw=String(q||'').trim();if(!raw)return {err:'empty'};const id=raw.toUpperCase().match(/EMP-\d{4}-[AWM]\d+/);
+ if(id){const s=ix.byId[id[0]];return s?{s}:{err:'Unknown Staff ID '+id[0]}}
+ const k=nameKey(raw);if(ix.byName[k])return ix.byName[k].length===1?{s:ix.byName[k][0]}:{err:'More than one person is called "'+raw+'". Use the Staff ID.'};
+ const toks=k.split(' ').filter(w=>w.length>=2);if(toks.length){const hits=db.staff.filter(s=>{const w=nameKey(s.name).split(' ');return toks.every(t=>w.includes(t))});if(hits.length===1)return {s:hits[0]};if(hits.length>1)return {err:'"'+raw+'" matches more than one person. Use the Staff ID.'}}
+ return {err:'No staff member found for "'+raw+'"'}}
+function csvLine(l){const out=[];let cur='',q=false;for(let i=0;i<l.length;i++){const ch=l[i];if(q){if(ch==='"'){if(l[i+1]==='"'){cur+='"';i++}else q=false}else cur+=ch}else if(ch==='"')q=true;else if(ch===','){out.push(cur.trim());cur=''}else cur+=ch}out.push(cur.trim());return out}
+function parseTextToGrid(text){const lines=String(text).replace(/\r/g,'').split('\n').filter(l=>l.trim());if(!lines.length)return [];
+ const pipes=lines.filter(l=>l.includes('|')).length>=Math.max(1,lines.length/2);
+ return lines.map(l=>{if(pipes){const c=l.split('|').map(x=>x.trim());if(c[0]==='')c.shift();if(c.length&&c[c.length-1]==='')c.pop();return c}
+  if(l.includes('\t'))return l.split('\t').map(x=>x.trim());return csvLine(l)}).filter(r=>r.length&&!r.every(c=>c===''||/^:?-{2,}:?$/.test(c)))}
+const MON={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+function ymdOf(y,m,d){const t=new Date(Date.UTC(y,m,d));return t.getUTCFullYear()===y&&t.getUTCMonth()===m&&t.getUTCDate()===d?t.toISOString().slice(0,10):null}
+function parseDateHead(h,wk,yr){h=String(h==null?'':h).trim();if(!h)return null;let m;
+ if(m=/^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(h))return ymdOf(+m[1],+m[2]-1,+m[3]);
+ if(m=/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/.exec(h)){let y=+m[3];if(y<100)y+=2000;return ymdOf(y,+m[2]-1,+m[1])}
+ if(m=/^(\d{1,2})[\/.](\d{1,2})$/.exec(h))return ymdOf(yr,+m[2]-1,+m[1]);
+ if(m=/(\d{1,2})(?:st|nd|rd|th)?[\s\-\/]*([A-Za-z]{3})[a-z]*\.?(?:[\s,\-\/]*(\d{4}))?/.exec(h)){const mo=MON[m[2].toLowerCase()];if(mo!==undefined)return ymdOf(m[3]?+m[3]:yr,mo,+m[1])}
+ if(/^\d{5}$/.test(h))return new Date(Date.UTC(1899,11,30)+(+h)*864e5).toISOString().slice(0,10);
+ const wd=['mon','tue','wed','thu','fri','sat','sun'].indexOf(h.slice(0,3).toLowerCase());
+ if(wd>=0&&/^(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?(\s|$)/i.test(h)&&wk)return iso(addDays(new Date(wk+'T00:00'),wd));
+ return null}
+function parseCell(c){const t=String(c==null?'':c).trim();if(!t)return {skip:true};
+ const toks=t.split(/[+,&;\/\n]|\band\b/i).map(x=>x.trim()).filter(Boolean),ids=[],bad=[];
+ for(const k of toks){const l=k.toLowerCase();if(/^(off|x|-|–|—|leave|holiday|rest|weekly off|wo)$/.test(l))continue;
+  let hit=db.tpl.find(p=>p.name.toLowerCase()===l)||db.tpl.find(p=>(p.start+'-'+p.end)===l.replace(/\s/g,'').replace(/–|—/g,'-'));
+  if(!hit){const c2=db.tpl.filter(p=>p.name.toLowerCase().startsWith(l));if(c2.length===1)hit=c2[0]}
+  if(hit){if(!ids.includes(hit.id))ids.push(hit.id)}else bad.push(k)}
+ return bad.length?{bad}:{tids:ids}}
+function gridToChanges(grid,wk){const yr=new Date().getFullYear(),ix=staffIndex(),problems=[];let hr=-1,dcols=[];
+ for(let r=0;r<Math.min(grid.length,15);r++){const cols=[];grid[r].forEach((h,c)=>{const d=parseDateHead(h,wk,yr);if(d)cols.push({c,d})});if(cols.length>=1&&cols.length>=Math.floor(grid[r].length/3)){hr=r;dcols=cols;break}}
+ if(hr<0)return null;
+ const head=grid[hr].map(x=>String(x||'').toLowerCase()),isDate=new Set(dcols.map(x=>x.c));
+ let idc=head.findIndex((h,c)=>!isDate.has(c)&&/\bid\b|emp(loyee)? ?(no|code)|code/.test(h)),nmc=head.findIndex((h,c)=>!isDate.has(c)&&c!==idc&&/name|staff|employee|person|nurse|doctor/.test(h));
+ if(idc<0&&nmc<0)nmc=head.findIndex((h,c)=>!isDate.has(c));
+ const changes=[];
+ for(let r=hr+1;r<grid.length;r++){const row=grid[r],who=(idc>=0&&row[idc])?row[idc]:row[nmc],alt=nmc>=0?row[nmc]:'';
+  const cells=dcols.map(({c,d})=>({d,v:row[c]})).filter(x=>String(x.v==null?'':x.v).trim());
+  if(!String(who||'').trim()&&!String(alt||'').trim())continue;
+  let f=findStaff(who,ix);if(f.err&&alt&&nmc!==idc)f=findStaff(alt,ix);
+  if(f.err){if(cells.length)problems.push('Row '+(r+1)+': '+f.err);continue}
+  for(const {d,v} of cells){const pc=parseCell(v);if(pc.skip)continue;if(pc.bad){problems.push(f.s.name+' on '+fmtD(d)+': unknown shift "'+pc.bad.join(', ')+'"');continue}
+   changes.push({sid:f.s.id,dt:d,tids:pc.tids,mode:pc.tids.length?imp.mode:'set'})}}
+ return {changes,problems}}
+async function pdfText(f){await loadScript(PDF_URL);const lib=window.pdfjsLib;lib.GlobalWorkerOptions.workerSrc=PDF_WORKER;const doc=await lib.getDocument({data:await f.arrayBuffer()}).promise,out=[];
+ for(let p=1;p<=doc.numPages;p++){const tc=await (await doc.getPage(p)).getTextContent(),rows={};tc.items.forEach(it=>{if(!it.str||!it.str.trim())return;const y=Math.round(it.transform[5]/4);(rows[y]=rows[y]||[]).push(it)});
+  Object.keys(rows).map(Number).sort((a,b)=>b-a).forEach(y=>{const its=rows[y].sort((a,b)=>a.transform[4]-b.transform[4]);let line='',end=null;its.forEach(it=>{const x=it.transform[4];line+=(end===null?'':(x-end>9?'\t':' '))+it.str.trim();end=x+(it.width||0)});out.push(line)})}
+ return out.join('\n')}
+async function aiExtract(raw,wk){const lines=raw.split('\n').filter(l=>l.trim()),ix=staffIndex(),changes=[],problems=[],chunks=[];for(let i=0;i<lines.length;i+=10)chunks.push(lines.slice(i,i+10));
+ for(let i=0;i<chunks.length;i++){imp.msg='Reading with AI: part '+(i+1)+' of '+chunks.length+'...';render();
+  const j=await api('aiParse',{text:(i?lines[0]+'\n':'')+chunks[i].join('\n'),hint:wk},1);
+  for(const [person,date,shifts] of j.rows){const f=findStaff(person,ix);if(f.err){problems.push(f.err);continue}
+   const pc=parseCell(/^off$/i.test(shifts)?'OFF':shifts);if(pc.skip)continue;if(pc.bad){problems.push(f.s.name+' on '+date+': unknown shift "'+pc.bad.join(', ')+'"');continue}
+   changes.push({sid:f.s.id,dt:date,tids:pc.tids,mode:pc.tids.length?imp.mode:'set'})}}
+ imp.msg='';return {changes,problems:[...new Set(problems)]}}
+async function importRead(){imp.msg='';const fi=document.getElementById('impFile'),f=fi&&fi.files&&fi.files[0],txt=((document.getElementById('impText')||{}).value||'').trim(),wk=(document.getElementById('impWeek')||{}).value||iso(ws);
+ if(!f&&!txt){imp.msg='Choose a file or paste a table first.';return render()}
+ imp.busy=true;imp.fileName=f?f.name:'pasted text';render();
+ try{let grid,raw='';
+  if(f){const ext=(f.name.split('.').pop()||'').toLowerCase();
+   if(ext==='xlsx'||ext==='xls'){await loadScript(XLSX_URL);const wb=XLSX.read(await f.arrayBuffer(),{type:'array',cellDates:true});grid=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,raw:false,dateNF:'yyyy-mm-dd',defval:''}).map(r=>r.map(x=>String(x==null?'':x).trim()));raw=grid.map(r=>r.join('\t')).join('\n')}
+   else if(ext==='pdf'){raw=await pdfText(f);grid=parseTextToGrid(raw)}
+   else{raw=await f.text();grid=parseTextToGrid(raw)}}
+  else{raw=txt;grid=parseTextToGrid(raw)}
+  let res=gridToChanges(grid,wk);
+  if(!res||(!res.changes.length&&!res.problems.length)){
+   if(!db.ai)throw new Error('I could not recognise the layout of this roster. Use the template in step 1, or switch on the AI Assistant (guide, Part F) so I can read free-form rosters.');
+   res=await aiExtract(raw,wk)}
+  if(!res.changes.length)throw new Error('I found no roster entries to import.'+(res.problems.length?' '+res.problems[0]:''));
+  imp.problems=res.problems;imp.proposed=res.changes;
+  const all=imp.proposed;let total=0,noop=0,sample=[],problems=[...res.problems],from='',to='';
+  for(let i=0;i<all.length;i+=3000){const pv=(await api('previewChanges',{changes:all.slice(i,i+3000)},1)).preview;total+=pv.total;noop+=pv.noop;if(sample.length<300)sample=sample.concat(pv.sample).slice(0,300);problems.push(...pv.problems);if(pv.from&&(!from||pv.from<from))from=pv.from;if(pv.to&&pv.to>to)to=pv.to}
+  imp.preview={total,noop,people:new Set(all.map(x=>x.sid)).size,from,to,sample,problems:problems.slice(0,40),moreProblems:Math.max(0,problems.length-40)};imp.step='preview';imp.msg=''
+ }catch(e){imp.msg=e.message;imp.step='start'}
+ imp.busy=false;render()}
+async function importConfirm(){imp.busy=true;render();let applied=0,undo=[];
+ try{const all=imp.proposed;for(let i=0;i<all.length;i+=1500){const j=await api('applyChanges',{changes:all.slice(i,i+1500),source:'import',note:imp.fileName},1);applied+=j.applied;undo=undo.concat(j.undo||[])}
+  lastUndo=undo.length?undo:null;imp={step:'start',mode:imp.mode,busy:false,msg:'Done. '+applied+' roster change'+(applied===1?'':'s')+' saved and recorded in the System Logs. Open the Roster tab to see them.',fileName:'',proposed:[],problems:[],preview:null}}
+ catch(e){imp.busy=false;imp.msg='Could not finish saving: '+e.message+' Some changes may already be saved. Importing the same file again is safe.'}render()}
+function importCancel(){imp={step:'start',mode:imp.mode,busy:false,msg:'',fileName:'',proposed:[],problems:[],preview:null};render()}
 
 /* ---------- STATUS BAR, IN-APP ALERTS, LIVE REFRESH ---------- */
 const SHIFT_MSG='Your shift has started. Please ensure you are logged into your dashboard and have clocked in via the designated hospital geofence.';

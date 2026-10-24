@@ -116,6 +116,117 @@ async function listOwnAtt(kv, id, names) {
   return keys.map((k) => { const [, , date, hhmm, d] = k.split('/'); return { id, name: (names.get(id) || {}).name || id, date, time: hhmm.slice(0, 2) + ':' + hhmm.slice(2), d: Number(d) }; });
 }
 
+
+/* ---------- bulk roster changes (used by Import Roster and the AI Assistant) ---------- */
+const byStart = (order) => (a, b) => order.get(a).localeCompare(order.get(b));
+async function resolveChanges(kv, cfg, byId, list) {
+  const tplIds = new Set(cfg.tpl.map((t) => t.id)), order = new Map(cfg.tpl.map((t) => [t.id, t.start])), problems = [], uniq = new Map();
+  for (const c of list) {
+    const s = byId.get(String(c.sid || '')), dt = String(c.dt || ''), mode = ['set', 'add', 'remove'].includes(c.mode) ? c.mode : 'set';
+    const tids = [...new Set((Array.isArray(c.tids) ? c.tids : []).map(String))];
+    if (!s) { problems.push('Unknown staff member ' + clean(c.sid, 30)); continue; }
+    if (!validDate(dt)) { problems.push('Invalid date for ' + s.name); continue; }
+    if (tids.length > 8 || tids.some((t) => !tplIds.has(t))) { problems.push('Unknown shift for ' + s.name + ' on ' + dt); continue; }
+    uniq.set(s.id + '|' + dt, { s, dt, mode, tids });
+  }
+  const valid = [...uniq.values()], maps = {};
+  await Promise.all([...new Set(valid.map((v) => mondayOf(v.dt)))].map(async (w) => { maps[w] = await readWeek(kv, w); }));
+  const rows = []; let noop = 0; const cmp = byStart(order);
+  for (const v of valid) {
+    const before = asList(maps[mondayOf(v.dt)][v.s.id + '|' + v.dt]).filter((t) => tplIds.has(t)).sort(cmp);
+    const after = (v.mode === 'add' ? [...new Set([...before, ...v.tids])] : v.mode === 'remove' ? before.filter((t) => !v.tids.includes(t)) : v.tids).slice().sort(cmp);
+    if (before.length === after.length && before.every((x, i) => x === after[i])) { noop++; continue; }
+    rows.push({ sid: v.s.id, dt: v.dt, before, after });
+  }
+  return { rows, noop, problems };
+}
+async function applyRows(kv, rows) {
+  const groups = new Map();
+  for (const r of rows) { const k = 'roster/' + mondayOf(r.dt) + '/' + shardOf(r.sid); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); }
+  await Promise.all([...groups].map(async ([k, rs]) => {
+    const part = (await kv.get(k)) || {};
+    for (const r of rs) { const key = r.sid + '|' + r.dt; if (r.after.length) part[key] = r.after; else delete part[key]; }
+    await kv.set(k, part);
+  }));
+}
+function previewOf(rows, noop, problems, cfg, byId) {
+  const nm = new Map(cfg.tpl.map((t) => [t.id, t.name])), ids = new Set(rows.map((r) => r.sid)), dates = rows.map((r) => r.dt).sort();
+  return {
+    total: rows.length, noop, people: ids.size, from: dates[0] || '', to: dates[dates.length - 1] || '', problems: problems.slice(0, 40), moreProblems: Math.max(0, problems.length - 40),
+    sample: rows.slice(0, 300).map((r) => ({ id: r.sid, name: (byId.get(r.sid) || {}).name || r.sid, dt: r.dt, before: r.before.map((t) => nm.get(t)), after: r.after.map((t) => nm.get(t)) })),
+  };
+}
+
+/* ---------- AI assistant plumbing (the AI only PROPOSES; nothing is saved without Confirm) ---------- */
+async function callAI(env, system, user, ms = 8500) {
+  const key = env.AI_API_KEY || env.GEMINI_API_KEY;
+  if (!key) fail(400, 'The AI assistant is not switched on yet. The Master Admin needs to add AI_API_KEY in Netlify (see the guide, Part F).');
+  const provider = String(env.AI_PROVIDER || 'gemini').toLowerCase();
+  const model = env.AI_MODEL || { gemini: 'gemini-flash-latest', anthropic: 'claude-haiku-5-5' }[provider] || 'gpt-4o-mini';
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    let r, text = '';
+    if (provider === 'gemini') {
+      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) });
+    } else if (provider === 'anthropic') {
+      r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', signal: ctl.signal, headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({ model, max_tokens: 3000, temperature: 0, system, messages: [{ role: 'user', content: user }] }) });
+    } else {
+      r = await fetch((env.AI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '') + '/chat/completions', { method: 'POST', signal: ctl.signal, headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }) });
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) fail(502, `The AI service refused the request (${r.status}). ${clean((j.error && (j.error.message || j.error)) || '', 140)} If the model name is wrong, set AI_MODEL in Netlify.`);
+    text = provider === 'gemini' ? ((j.candidates || [])[0]?.content?.parts || []).map((x) => x.text || '').join('')
+      : provider === 'anthropic' ? (j.content || []).map((x) => x.text || '').join('') : j.choices?.[0]?.message?.content || '';
+    const t = String(text).replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+    try { return JSON.parse(t); } catch (e) { const m = t.match(/\{[\s\S]*\}/); if (m) { try { return JSON.parse(m[0]); } catch (e2) { /* fall through */ } } fail(502, 'The AI answered in an unexpected format. Please try again.'); }
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    if (e && e.name === 'AbortError') fail(504, 'The AI took too long to answer. Try a shorter request.');
+    fail(502, 'Could not reach the AI service. Try again in a minute.');
+  } finally { clearTimeout(timer); }
+}
+const PLAN_SYSTEM = `You convert a hospital roster manager's request into JSON. Output ONLY one JSON object: {"reply": string, "ops": [ {"ids": [staff ids], "dept": string|null, "all": boolean, "from": "YYYY-MM-DD", "to": "YYYY-MM-DD", "weekdays": ["mon","tue",...]|null, "shifts": [shift names], "mode": "set"|"add"|"remove"|"clear"} ]}.
+Rules:
+- "reply" is one or two plain sentences saying exactly what you understood, including the exact dates (for example "Morning shift for Anita Rao from Tue 27 Oct to Mon 2 Nov"), or a short question if something is unclear.
+- Use ONLY staff ids listed under CANDIDATES. If a name is not clearly one candidate, return "ops": [] and ask which person is meant. Never invent ids or shift names.
+- Use ONLY shift names listed under SHIFTS, written exactly as listed.
+- mode "set" = replace that day's shifts with exactly these shifts; "add" = keep existing shifts and add these (use for "also", "in addition", "add"); "remove" = take these shifts away; "clear" = remove every shift (day off, "clear", "cancel all"). When the user simply says "assign", use "set".
+- Use dept (exact name from DEPARTMENTS) for "everyone in ICU"; use all=true only when the user clearly says everyone/all staff; otherwise use ids.
+- Dates: use the CALENDAR to resolve words. "next N days" starts TOMORROW and covers N days. "this week" = Monday to Sunday of the current week; "next week" = Monday to Sunday of the following week. "today" and "tomorrow" are single days. A weekday name means the next such date from today. Set "from" and "to" (inclusive); use "weekdays" only when the user restricts days (for example "weekdays only" = mon..fri). Never cover more than 62 days.
+- If the request is not about the roster, return "ops": [] and a short helpful reply.`;
+const PARSE_SYSTEM = `You extract roster entries from messy text copied from a spreadsheet or PDF. Output ONLY one JSON object: {"rows": [[person, date, shifts], ...]} where person is the staff name or id exactly as written, date is YYYY-MM-DD, and shifts is the shift names joined by "+" (for example "Morning+Evening"), or "OFF" for a day off. Use only shift names from SHIFTS (map obvious abbreviations such as M, E, N to them). Dates may be written as columns headers, weekdays (use WEEKSTART to turn Monday..Sunday into dates), or day/month/year (day first). Skip empty cells and anything that is not a roster entry. Never invent entries.`;
+const DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const normName = (x) => String(x || '').toLowerCase().replace(/\b(dr|mr|mrs|ms|prof)\b\.?/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+function expandOps(ops, cfg, staff) {
+  const changes = [], problems = [], tplBy = new Map();
+  cfg.tpl.forEach((t) => { tplBy.set(t.name.toLowerCase(), t.id); tplBy.set(t.start + '-' + t.end, t.id); });
+  const byId = new Map(staff.map((s) => [s.id, s]));
+  for (const op of ops) {
+    const from = clean(op.from, 10), to = clean(op.to || op.from, 10), mode = ['set', 'add', 'remove', 'clear'].includes(op.mode) ? op.mode : 'set';
+    if (!validDate(from) || !validDate(to) || to < from) { problems.push('The dates in that request were not clear.'); continue; }
+    const span = (Date.parse(to) - Date.parse(from)) / 864e5 + 1;
+    if (span > 62) { problems.push('That covers more than 62 days. Please ask for a shorter period.'); continue; }
+    const tids = []; let bad = false;
+    for (const nme of Array.isArray(op.shifts) ? op.shifts : []) { const id = tplBy.get(String(nme).trim().toLowerCase()); if (id) tids.push(id); else { problems.push('Unknown shift "' + clean(nme, 30) + '".'); bad = true; } }
+    if (bad || (mode !== 'clear' && !tids.length)) { if (!bad) problems.push('No shift was named.'); continue; }
+    let who = [];
+    if (op.all === true) who = staff.filter((s) => s.role !== 'master');
+    else if (op.dept) { if (!cfg.depts.includes(op.dept)) { problems.push('Unknown department "' + clean(op.dept, 30) + '".'); continue; } who = staff.filter((s) => s.dept === op.dept && s.role !== 'master'); }
+    else who = (Array.isArray(op.ids) ? op.ids : []).map((i) => byId.get(String(i))).filter(Boolean);
+    if (!who.length) { problems.push('No matching staff member was found.'); continue; }
+    const wd = Array.isArray(op.weekdays) && op.weekdays.length ? new Set(op.weekdays.map((d) => String(d).slice(0, 3).toLowerCase())) : null;
+    for (let i = 0; i < span; i++) {
+      const dt = ymd(Date.parse(from) + i * 864e5); if (wd && !wd.has(DAYS[new Date(dt + 'T00:00:00Z').getUTCDay()])) continue;
+      for (const s of who) changes.push({ sid: s.id, dt, tids: mode === 'clear' ? [] : tids, mode: mode === 'clear' ? 'set' : mode });
+    }
+  }
+  if (changes.length > 3000) return { changes: [], problems: ['That would change more than 3000 days at once. Please narrow it down.'] };
+  return { changes, problems };
+}
+
 /* ---------- the server entry point used by the app ---------- */
 export async function handle({ kv, env, origin, send = sendMail }, body) {
   const tz = zoneOf(env);
@@ -153,6 +264,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
         staff: list.map((s) => ({ id: s.id, name: s.name, role: s.role, designation: s.designation || '', dept: s.dept, ...(mgr ? { email: s.email || '' } : {}) })),
       };
       if (mgr) {
+        out.ai = !!(env.AI_API_KEY || env.GEMINI_API_KEY);
         out.att = (await listAtt(kv, 'att/' + today + '/', byId)).slice(0, 500);
         out.pending = (await kv.list('pend/')).map((k) => k.slice(5)).filter((id) => byId.has(id)).map((id) => ({ id, name: byId.get(id).name }));
         await Promise.all(out.pending.map(async (x) => { const a = await kv.get('acct/' + x.id); x.resetAt = a && a.resetAt; }));
@@ -225,6 +337,11 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
     const needMgr = () => { if (!isMgr) fail(403, 'You do not have permission to do that.'); };
     const find = (id) => byId.get(clean(id, 40)) || fail(404, 'Staff member not found.');
     const reply = async (extra = {}) => ok({ ...extra, state: await state(me, p.week, p.dept) });
+    const aiGate = async (uid) => {
+      const k = 'ai/' + uid + '/' + new Date().toISOString().slice(0, 13), n = ((await kv.get(k)) || 0) + 1;
+      if (n > 150) fail(429, 'The AI has been used a lot this hour. Please wait a little.');
+      await kv.set(k, n);
+    };
     const saveStaff = () => kv.set('staff', staff);
     const saveCfg = () => kv.set('cfg', cfg);
 
@@ -317,6 +434,40 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
         if ((await kv.list('attp/' + me.id + '/' + date + '/')).length) fail(409, 'You have already clocked in today.');
         await Promise.all([kv.set(`attp/${me.id}/${date}/${hhmm}/${d}`, 1), kv.set(`att/${date}/${me.id}/${hhmm}/${d}`, 1)]);
         return reply();
+      }
+      case 'previewChanges': {
+        needMgr(); const list = Array.isArray(p.changes) ? p.changes.slice(0, 3000) : [];
+        const r = await resolveChanges(kv, cfg, byId, list);
+        return ok({ preview: previewOf(r.rows, r.noop, r.problems, cfg, byId) });
+      }
+      case 'applyChanges': {
+        needMgr(); const list = Array.isArray(p.changes) ? p.changes.slice(0, 3000) : [];
+        const r = await resolveChanges(kv, cfg, byId, list); await applyRows(kv, r.rows);
+        const note = clean(p.note, 160);
+        if (r.rows.length) await log(me.name, p.source === 'ai' ? `AI assistant: "${note}" - ${r.rows.length} roster changes` : p.source === 'undo' ? `Undid ${r.rows.length} roster changes` : `Roster import (${note || 'pasted text'}): ${r.rows.length} roster changes`);
+        return reply({ applied: r.rows.length, noop: r.noop, problems: r.problems.slice(0, 20), undo: r.rows.map((x) => ({ sid: x.sid, dt: x.dt, tids: x.before, mode: 'set' })) });
+      }
+      case 'aiPlan': {
+        needMgr(); const msg = clean(p.message, 600); if (!msg) fail(400, 'Type a request first.');
+        await aiGate(me.id);
+        const today = todayIn(tz), cal = [...Array(21)].map((_, i) => { const d = ymd(Date.parse(today) + i * 864e5); return DAYS[new Date(d + 'T00:00:00Z').getUTCDay()] + ' ' + d; }).join(', ');
+        const hist = (Array.isArray(p.history) ? p.history : []).slice(-6).map((h) => (h.role === 'user' ? 'MANAGER: ' : 'ASSISTANT: ') + clean(h.text, 300)).join('\n');
+        const words = new Set((msg + ' ' + hist).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 2));
+        const pool = staff.filter((s) => s.role !== 'master'), cand = (pool.length <= 60 ? pool : pool.filter((s) => normName(s.name).split(' ').some((w) => words.has(w)))).slice(0, 40);
+        const user = `TODAY: ${DAYS[new Date(today + 'T00:00:00Z').getUTCDay()]} ${today}\nCALENDAR: ${cal}\nSHIFTS: ${cfg.tpl.map((t) => `${t.name} (${t.start}-${t.end})`).join('; ')}\nDEPARTMENTS: ${cfg.depts.join('; ')}\nCANDIDATES (id | name | department):\n${cand.map((s) => `${s.id} | ${s.name} | ${s.dept}`).join('\n') || '(none matched)'}\n${hist ? 'RECENT CONVERSATION:\n' + hist + '\n' : ''}REQUEST: ${msg}`;
+        const out = await callAI(env, PLAN_SYSTEM, user), reply0 = clean(out && out.reply, 500);
+        const ex = expandOps(Array.isArray(out && out.ops) ? out.ops.slice(0, 10) : [], cfg, staff);
+        if (!ex.changes.length) return ok({ reply: reply0 || 'I could not work out a change from that. Please say which person, which shift and which dates.', problems: ex.problems, preview: null, changes: [] });
+        const r = await resolveChanges(kv, cfg, byId, ex.changes);
+        return ok({ reply: reply0, preview: previewOf(r.rows, r.noop, [...ex.problems, ...r.problems], cfg, byId), changes: r.rows.map((x) => ({ sid: x.sid, dt: x.dt, tids: x.after, mode: 'set' })) });
+      }
+      case 'aiParse': {
+        needMgr(); const text = String(p.text || '').slice(0, 6000); if (!text.trim()) fail(400, 'There is no text to read.');
+        await aiGate(me.id);
+        const hint = validDate(clean(p.hint, 10)) ? clean(p.hint, 10) : mondayOf(todayIn(tz));
+        const out = await callAI(env, PARSE_SYSTEM, `TODAY: ${todayIn(tz)}\nWEEKSTART (Monday): ${hint}\nSHIFTS: ${cfg.tpl.map((t) => `${t.name} (${t.start}-${t.end})`).join('; ')}\nTEXT:\n${text}`);
+        const rows = (Array.isArray(out && out.rows) ? out.rows : []).filter((r) => Array.isArray(r) && r.length >= 3).slice(0, 400).map((r) => [clean(r[0], 80), clean(r[1], 10), clean(r[2], 80)]);
+        return ok({ rows });
       }
       default: fail(400, 'Unknown request.');
     }
