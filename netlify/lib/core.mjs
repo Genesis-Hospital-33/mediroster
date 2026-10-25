@@ -158,35 +158,48 @@ function previewOf(rows, noop, problems, cfg, byId) {
 }
 
 /* ---------- AI assistant plumbing (the AI only PROPOSES; nothing is saved without Confirm) ---------- */
-async function callAI(env, system, user, ms = 8500) {
+async function callAI(env, system, user, totalMs = 8500) {
   const key = env.AI_API_KEY || env.GEMINI_API_KEY;
   if (!key) fail(400, 'The AI assistant is not switched on yet. The Master Admin needs to add AI_API_KEY in Netlify (see the guide, Part F).');
   const provider = String(env.AI_PROVIDER || 'gemini').toLowerCase();
-  const model = env.AI_MODEL || { gemini: 'gemini-flash-latest', anthropic: 'claude-haiku-5-5' }[provider] || 'gpt-4o-mini';
-  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), ms);
-  try {
-    let r, text = '';
-    if (provider === 'gemini') {
-      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) });
-    } else if (provider === 'anthropic') {
-      r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', signal: ctl.signal, headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({ model, max_tokens: 3000, temperature: 0, system, messages: [{ role: 'user', content: user }] }) });
-    } else {
-      r = await fetch((env.AI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '') + '/chat/completions', { method: 'POST', signal: ctl.signal, headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }) });
-    }
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) fail(502, `The AI service refused the request (${r.status}). ${clean((j.error && (j.error.message || j.error)) || '', 140)} If the model name is wrong, set AI_MODEL in Netlify.`);
-    text = provider === 'gemini' ? ((j.candidates || [])[0]?.content?.parts || []).map((x) => x.text || '').join('')
-      : provider === 'anthropic' ? (j.content || []).map((x) => x.text || '').join('') : j.choices?.[0]?.message?.content || '';
-    const t = String(text).replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
-    try { return JSON.parse(t); } catch (e) { const m = t.match(/\{[\s\S]*\}/); if (m) { try { return JSON.parse(m[0]); } catch (e2) { /* fall through */ } } fail(502, 'The AI answered in an unexpected format. Please try again.'); }
-  } catch (e) {
-    if (e instanceof HttpError) throw e;
-    if (e && e.name === 'AbortError') fail(504, 'The AI took too long to answer. Try a shorter request.');
-    fail(502, 'Could not reach the AI service. Try again in a minute.');
-  } finally { clearTimeout(timer); }
+  // A fast "lite" model first (quick and rarely overloaded), the regular one as backup. AI_MODEL overrides both.
+  const models = env.AI_MODEL ? [env.AI_MODEL] : provider === 'gemini' ? ['gemini-flash-lite-latest', 'gemini-flash-latest'] : [provider === 'anthropic' ? 'claude-haiku-5-5' : 'gpt-4o-mini'];
+  const t0 = Date.now(); let last = 'no answer';
+  const attempt = async (model, ms) => {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), ms);
+    try {
+      let r;
+      if (provider === 'gemini') {
+        r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) });
+      } else if (provider === 'anthropic') {
+        r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', signal: ctl.signal, headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+          body: JSON.stringify({ model, max_tokens: 3000, temperature: 0, system, messages: [{ role: 'user', content: user }] }) });
+      } else {
+        r = await fetch((env.AI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '') + '/chat/completions', { method: 'POST', signal: ctl.signal, headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }) });
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (r.status === 401 || r.status === 403) fail(502, `The AI service refused the key (${r.status}). Check AI_API_KEY in Netlify. ${clean((j.error && (j.error.message || j.error)) || '', 120)}`);
+        if ([400, 404, 408, 429, 500, 502, 503, 504].includes(r.status)) return { retry: true, why: String(r.status) };
+        fail(502, `The AI service refused the request (${r.status}). ${clean((j.error && (j.error.message || j.error)) || '', 140)}`);
+      }
+      const text = provider === 'gemini' ? ((j.candidates || [])[0]?.content?.parts || []).map((x) => x.text || '').join('')
+        : provider === 'anthropic' ? (j.content || []).map((x) => x.text || '').join('') : j.choices?.[0]?.message?.content || '';
+      const t = String(text).replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+      try { return { ok: true, data: JSON.parse(t) }; } catch (e) { const m = t.match(/\{[\s\S]*\}/); if (m) { try { return { ok: true, data: JSON.parse(m[0]) }; } catch (e2) { /* next */ } } return { retry: true, why: 'unexpected answer' }; }
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      return { retry: true, why: e && e.name === 'AbortError' ? 'too slow' : 'no connection' };
+    } finally { clearTimeout(timer); }
+  };
+  for (let i = 0; i < models.length; i++) {
+    const left = totalMs - (Date.now() - t0); if (left < 1200) break;
+    const r = await attempt(models[i], i < models.length - 1 ? Math.min(left, 5500) : left);
+    if (r.ok) return r.data; last = r.why;
+  }
+  fail(503, `The AI service is busy or slow right now (${last}). Please try again in a minute.`);
 }
 const PLAN_SYSTEM = `You convert a hospital roster manager's request into JSON. Output ONLY one JSON object: {"reply": string, "ops": [ {"ids": [staff ids], "dept": string|null, "all": boolean, "from": "YYYY-MM-DD", "to": "YYYY-MM-DD", "weekdays": ["mon","tue",...]|null, "shifts": [shift names], "mode": "set"|"add"|"remove"|"clear"} ]}.
 Rules:
@@ -453,7 +466,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
         const today = todayIn(tz), cal = [...Array(21)].map((_, i) => { const d = ymd(Date.parse(today) + i * 864e5); return DAYS[new Date(d + 'T00:00:00Z').getUTCDay()] + ' ' + d; }).join(', ');
         const hist = (Array.isArray(p.history) ? p.history : []).slice(-6).map((h) => (h.role === 'user' ? 'MANAGER: ' : 'ASSISTANT: ') + clean(h.text, 300)).join('\n');
         const words = new Set((msg + ' ' + hist).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 2));
-        const pool = staff.filter((s) => s.role !== 'master'), cand = (pool.length <= 60 ? pool : pool.filter((s) => normName(s.name).split(' ').some((w) => words.has(w)))).slice(0, 40);
+        const wl = [...words], pool = staff, cand = (pool.length <= 60 ? pool : pool.filter((s) => normName(s.name).split(' ').some((w) => words.has(w) || (w.length >= 4 && wl.some((x) => x.length >= 4 && x.slice(0, 4) === w.slice(0, 4)))))).slice(0, 40);
         const user = `TODAY: ${DAYS[new Date(today + 'T00:00:00Z').getUTCDay()]} ${today}\nCALENDAR: ${cal}\nSHIFTS: ${cfg.tpl.map((t) => `${t.name} (${t.start}-${t.end})`).join('; ')}\nDEPARTMENTS: ${cfg.depts.join('; ')}\nCANDIDATES (id | name | department):\n${cand.map((s) => `${s.id} | ${s.name} | ${s.dept}`).join('\n') || '(none matched)'}\n${hist ? 'RECENT CONVERSATION:\n' + hist + '\n' : ''}REQUEST: ${msg}`;
         const out = await callAI(env, PLAN_SYSTEM, user), reply0 = clean(out && out.reply, 500);
         const ex = expandOps(Array.isArray(out && out.ops) ? out.ops.slice(0, 10) : [], cfg, staff);
