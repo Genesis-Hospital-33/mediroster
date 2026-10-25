@@ -263,7 +263,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
     async function state(me, week, dept) {
       const mgr = me.role !== 'worker', today = todayIn(tz);
       const mon = validDate(week) ? mondayOf(week) : mondayOf(today);
-      const d = mgr ? clean(dept, 60) : (cfg.depts.includes(dept) ? dept : me.dept);
+      const d = (dept === 'ALL' || (mgr && !dept)) ? '' : mgr ? clean(dept, 60) : (cfg.depts.includes(dept) ? dept : me.dept);
       const ids = d ? new Set(staff.filter((s) => s.dept === d).map((s) => s.id)) : null;
       let roster = await readWeek(kv, mon);
       if (ids) Object.keys(roster).forEach((k) => { if (!ids.has(k.split('|')[0])) delete roster[k]; });
@@ -271,7 +271,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
       const cur = mondayOf(today);
       const own = await Promise.all([-7, 0, 7, 14].map((o) => kv.get('roster/' + ymd(Date.parse(cur + 'T00:00:00Z') + o * 864e5) + '/' + shardOf(me.id))));
       own.filter(Boolean).forEach((b) => Object.keys(b).forEach((k) => { if (k.startsWith(me.id + '|')) roster[k] = asList(b[k]); }));
-      const list = mgr ? staff : staff.filter((s) => s.id === me.id || ids.has(s.id));
+      const list = mgr || !ids ? staff : staff.filter((s) => s.id === me.id || ids.has(s.id));
       const out = {
         me: me.id, today, week: mon, dept: d || '', depts: cfg.depts, tpl: cfg.tpl, zone: cfg.zone, roster,
         staff: list.map((s) => ({ id: s.id, name: s.name, role: s.role, designation: s.designation || '', dept: s.dept, ...(mgr ? { email: s.email || '' } : {}) })),
