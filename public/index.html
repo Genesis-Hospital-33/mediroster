@@ -152,9 +152,10 @@ function staffView(){const {all,pages,rows}=staffRows();return `<h2 class="text-
   <textarea id="bulk" rows="4" class="inp text-sm font-mono" placeholder="Anita Rao, anita@gmail.com, Worker, ICU, Staff Nurse"></textarea>
   <div class="flex gap-2"><button class="btn2" onclick="bulkAdd()">Import list</button><button class="btn2" onclick="exportStaff()">Download staff list (CSV)</button></div></div>
  <div class="card p-3 flex flex-wrap items-center gap-3"><input class="inp !w-72" placeholder="Search name, ID, email, department" value="${esc(sq)}" onchange="setQ(this.value)"><div class="text-sm text-slate-500">${all.length} shown · page ${spage+1} of ${pages}</div><button class="btn2" ${spage<=0?'disabled':''} onclick="pg(-1)">‹ Prev</button><button class="btn2" ${spage>=pages-1?'disabled':''} onclick="pg(1)">Next ›</button></div>
- <div class="card overflow-x-auto"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-slate-600"><tr><th class="p-3">Name</th><th>Designation</th><th>Staff ID</th><th>Email</th><th>Permission</th><th>Status</th><th></th></tr></thead><tbody>`+
+ <div class="card overflow-x-auto"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-slate-600"><tr><th class="p-3">Name</th><th>Designation</th><th>Department</th><th>Staff ID</th><th>Email</th><th>Permission</th><th>Status</th><th></th></tr></thead><tbody>`+
  rows.map(s=>{const m=s.role==='master',st=stat[s.id];return `<tr class="border-t border-slate-100 align-top"><td class="p-3"><div class="font-semibold">${esc(s.name)}</div><div class="text-xs text-slate-500">${esc(s.dept)}</div></td>
  <td class="pr-2"><input class="inp !py-1 min-w-[150px]" value="${esc(s.designation)}" placeholder="No badge" onchange="setDes('${s.id}',this.value)"></td>
+ <td class="pr-2"><select class="inp !py-1 min-w-[120px]" onchange="setStaffDept('${s.id}',this.value)">${(db.depts.includes(s.dept)?db.depts:[...db.depts,s.dept]).map(d=>`<option value="${esc(d)}" ${d===s.dept?'selected':''}>${esc(d)}</option>`).join('')}</select></td>
  <td class="font-mono pr-2">${s.id}</td><td class="text-xs pr-2">${esc(s.email)}</td>
  <td class="pr-2">${m?'<span class="px-2 py-1 rounded-md bg-slate-900 text-white text-xs font-bold">Master Admin</span>':`<select class="inp !py-1" onchange="setRole('${s.id}',this.value)"><option value="worker" ${s.role==='worker'?'selected':''}>Worker</option><option value="admin" ${s.role==='admin'?'selected':''}>Admin</option></select>`}</td>
  <td class="pr-2 text-xs">${m?'<span class="text-emerald-700 font-semibold">Active</span>':!st?'…':st.reset?'<span class="text-red-700 font-semibold">Reset pending</span>':st.setup?`<span class="text-amber-700 font-semibold">Setup pending</span><div>Temp: <span class="font-mono">${esc(st.temp||'')}</span></div>`:'<span class="text-emerald-700 font-semibold">Active</span>'}</td>
@@ -168,6 +169,7 @@ async function bulkAdd(){const rows=$v('bulk').split(/\n/).map(l=>l.trim()).filt
 function exportStaff(){const rows=[['Name','Staff ID','Email','Permission','Designation','Department'],...db.staff.map(s=>[s.name,s.id,s.email||'',s.role,s.designation||'',s.dept])];
  const csv=rows.map(r=>r.map(x=>'"'+String(x).replace(/"/g,'""')+'"').join(',')).join('\n'),a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='mediroster-staff.csv';a.click()}
 async function setDes(id,v){try{await api('setDes',{id,v})}catch(e){}render()}
+async function setStaffDept(id,v){try{await api('setStaffDept',{id,dept:v})}catch(e){}render()}
 async function setRole(id,r){try{await api('setRole',{id,r})}catch(e){}render()}
 async function addStaff(){const n=$v('nn').trim(),em=$v('ne').trim();
  if(!n)return toast('Enter the full name.');if(!/^\S+@\S+\.\S+$/.test(em))return toast('Enter a valid email address.');

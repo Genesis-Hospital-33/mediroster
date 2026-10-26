@@ -373,6 +373,11 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
         return ok({ ok: true });
       }
       case 'setDes': { needMaster(); const s = find(p.id); s.designation = clean(p.v, 60); await saveStaff(); await log(me.name, `Designation for ${s.name} set to "${s.designation || '(none)'}"`); return reply(); }
+      case 'setStaffDept': {
+        needMaster(); const s = find(p.id), d = clean(p.dept, 60);
+        if (!cfg.depts.includes(d)) fail(400, 'Choose one of your departments.');
+        const old = s.dept; s.dept = d; await saveStaff(); await log(me.name, `Moved ${s.name} from ${old || '(none)'} to ${d}`); return reply();
+      }
       case 'setRole': {
         needMaster(); const s = find(p.id);
         if (s.role === 'master' || !['admin', 'worker'].includes(p.r)) fail(400, 'That change is not allowed.');
