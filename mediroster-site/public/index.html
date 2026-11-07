@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MediRoster – Hospital Workforce Portal</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<style>:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{background:#f1f5f9;color:#0f172a;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}button{touch-action:manipulation}.btn{background:#1d4ed8;color:#fff;border-radius:.5rem;padding:.55rem 1rem;font-weight:600}.btn:hover{background:#1e40af}.btn2{border:1px solid #cbd5e1;background:#fff;border-radius:.5rem;padding:.45rem .8rem;font-weight:500}.btn2:hover{background:#f1f5f9}.inp{border:1px solid #cbd5e1;border-radius:.5rem;padding:.55rem .75rem;width:100%;background:#fff;color:#0f172a}.card{background:#fff;border:1px solid #e2e8f0;border-radius:.75rem}@media print{header,#pop,#toast,#banner,.noprint{display:none!important}body{background:#fff}}</style>
+</head><body>
+<div id="app"><div class="p-8 text-slate-500">Loading…</div></div>
+<div id="pop" class="fixed hidden z-50 bg-white border border-slate-300 rounded-xl shadow-xl p-2 w-56"></div>
+<div id="banner" class="fixed top-3 left-1/2 -translate-x-1/2 hidden z-50 bg-blue-700 text-white rounded-xl shadow-2xl px-5 py-4 max-w-lg w-[92vw]"></div>
+<div id="toast" class="fixed bottom-4 left-1/2 -translate-x-1/2 hidden z-50 bg-slate-900 text-white text-sm rounded-lg px-4 py-3 max-w-md text-center"></div>
+<script>
+const API='/.netlify/functions/api',TK='mediroster_token_v3';
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const iso=d=>{d=new Date(d);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
+const addDays=(d,n)=>{d=new Date(d);d.setDate(d.getDate()+n);return d};
+const fmtD=d=>new Date(d+'T00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
+const monday=d=>{d=new Date(d);d.setHours(0,0,0,0);d.setDate(d.getDate()-((d.getDay()+6)%7));return d};
+let db=null,user=null,token=null,screen='login',setupUser=null,note=null,tab=null,ws=monday(new Date()),loc={mode:'gps',status:'idle'},bell=false,leaveData=null,chat=[],chatBusy=false,lastUndo=null,imp={step:'start',mode:'set',busy:false,msg:'',fileName:'',proposed:[],problems:[],preview:null},poll=null,tk=null,vis=false,rdept='',sq='',spage=0,stat={},attDate='',attRows=null,lastFetch=0;
+try{token=localStorage.getItem(TK)}catch(e){}
+async function api(action,payload,quiet){
+ try{const r=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,payload:{week:iso(ws),dept:rdept,...(payload||{})},token})});
+  const j=await r.json().catch(()=>({}));
+  if(r.status===401&&token&&action!=='login'&&action!=='setup'){dropSession();throw new Error(j.error||'Your session expired. Please sign in again.')}
+  if(!r.ok)throw new Error(j.error||('Request failed ('+r.status+')'));
+  if(j.state){db=j.state;user=db.staff.find(x=>x.id===db.me)||null;stat={};lastFetch=Date.now()}
+  return j}catch(e){if(!quiet)toast(e.message);throw e}}
+async function refresh(){try{await api('state')}catch(e){}render()}
+async function go(n){ws=addDays(ws,n);await refresh()}
+async function goToday(){ws=monday(new Date(today()+'T00:00'));await refresh()}
+async function setDept(v){rdept=v;await refresh()}
+function initView(){rdept=user.role==='worker'?user.dept:(db.staff.length>60&&db.depts[0]?db.depts[0]:'');ws=monday(new Date(db.today+'T00:00'));sq='';spage=0;stat={};attRows=null;attDate=''}
+async function enter(){tab=tabsFor(user.role)[0][0];initView();if(iso(ws)!==db.week||rdept!==db.dept)await refresh();else render();startPolling();tick()}
+function dropSession(){clearInterval(poll);clearInterval(tk);token=null;user=null;db=null;note=null;bell=false;try{localStorage.removeItem(TK)}catch(e){}document.getElementById('banner').classList.add('hidden');screen='login';loginView()}
+const today=()=>(db&&db.today)||iso(new Date());
+const tplOf=id=>db.tpl.find(t=>t.id===id);
+const isMgr=()=>user&&(user.role==='master'||user.role==='admin');
+const $v=id=>document.getElementById(id).value;
+const toast=m=>{const e=document.getElementById('toast');e.textContent=m;e.classList.remove('hidden');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.add('hidden'),4000)};
+const bdg=(s,dark)=>s.designation?`<span class="ml-1 px-1.5 py-0.5 rounded-md ${dark?'bg-slate-700 text-slate-100':'bg-slate-200 text-slate-700'} text-[11px] font-semibold align-middle">${esc(s.designation)}</span>`:'';
+
+/* ---------- AUTH SCREENS ---------- */
+function authShell(inner){document.getElementById('app').innerHTML=`<div class="min-h-screen grid lg:grid-cols-2">
+ <div class="bg-slate-900 text-white p-8 lg:p-14 flex flex-col justify-between">
+  <div class="flex items-center gap-3"><div class="w-11 h-11 rounded-xl bg-blue-600 grid place-items-center text-2xl font-bold">+</div><div><div class="text-xl font-bold">MediRoster</div><div class="text-slate-400 text-sm">Hospital Workforce &amp; Roster System</div></div></div>
+  <div class="my-10"><h1 class="text-3xl lg:text-4xl font-bold leading-tight">Every shift covered.<br>Every clock-in verified.</h1><p class="text-slate-300 mt-4 max-w-md">Manual scheduling, role-based access, geofenced attendance and live shift reminders in one secure portal.</p></div>
+  <div class="text-slate-400 text-xs">Authorised personnel only. Activity on this portal is logged.</div></div>
+ <div class="p-6 lg:p-14 flex flex-col justify-center gap-5 max-w-xl w-full mx-auto">${inner}</div></div>`}
+function loginView(){
+ if(screen==='setup')return setupView();if(screen==='forgot')return forgotView();
+ authShell(`<div><h2 class="text-2xl font-bold">Staff Portal Sign In</h2><p class="text-slate-500 text-sm">Enter your Staff ID and passcode.</p></div>
+ <form onsubmit="return doLogin(event)" class="space-y-4">
+  <div><label class="text-sm font-semibold">Staff ID</label><input id="lid" class="inp mt-1 font-mono uppercase" placeholder="EMP-2026-W01" autocomplete="off"></div>
+  <div><label class="text-sm font-semibold">Passcode</label><input id="lpw" type="password" maxlength="40" class="inp mt-1 font-mono" placeholder="••••••••" autocomplete="off"></div>
+  <div id="lerr" class="text-red-700 text-sm hidden"></div><button class="btn w-full py-3">Sign In</button></form>
+ <button class="w-full rounded-lg border-2 border-blue-700 text-blue-800 font-semibold py-2.5 hover:bg-blue-50" onclick="screen='forgot';loginView()">Forgot Passcode?</button>`)}
+function lerr(m){const e=document.getElementById('lerr');e.textContent=m;e.classList.remove('hidden')}
+async function doLogin(e){e.preventDefault();
+ try{const j=await api('login',{id:$v('lid'),pass:$v('lpw')},1);
+  if(j.needsSetup){setupUser={id:j.id,name:j.name,temp:$v('lpw')};screen='setup';return loginView()}
+  token=j.token;try{localStorage.setItem(TK,token)}catch(x){}startSession()}catch(x){lerr(x.message)}return false}
+async function startSession(){screen='login';loc={mode:'gps',status:'idle'};await enter()}
+async function signOut(){try{await api('logout',{},1)}catch(e){}dropSession()}
+function setupView(){const s=setupUser;authShell(`<div><h2 class="text-2xl font-bold">Account Initialization Setup</h2><p class="text-slate-500 text-sm">Welcome, ${esc(s.name)} (${s.id}). Create your permanent passcode to continue. Your temporary passcode will stop working.</p></div>
+ <form onsubmit="return doSetup(event)" class="space-y-4">
+  <div><label class="text-sm font-semibold">New passcode</label><input id="np1" type="password" maxlength="40" class="inp mt-1 font-mono" autocomplete="new-password"></div>
+  <div><label class="text-sm font-semibold">Confirm new passcode</label><input id="np2" type="password" maxlength="40" class="inp mt-1 font-mono" autocomplete="new-password"></div>
+  <div class="text-xs text-slate-500">At least 8 characters, with letters and numbers, different from your temporary passcode.</div>
+  <div id="lerr" class="text-red-700 text-sm hidden"></div><button class="btn w-full py-3">Save &amp; Continue</button></form>
+ <button class="text-sm text-slate-600 underline" onclick="screen='login';setupUser=null;loginView()">Cancel and return to sign in</button>`)}
+async function doSetup(e){e.preventDefault();const a=$v('np1'),b=$v('np2');
+ if(a.length<8||!/[A-Za-z]/.test(a)||!/\d/.test(a))return lerr('Use at least 8 characters including letters and numbers.');
+ if(a!==b)return lerr('The two passcodes do not match.');
+ try{const j=await api('setup',{id:setupUser.id,temp:setupUser.temp,newPass:a},1);token=j.token;try{localStorage.setItem(TK,token)}catch(x){}setupUser=null;startSession()}catch(x){lerr(x.message)}return false}
+function forgotView(msg){authShell(`<div><h2 class="text-2xl font-bold">Forgot Passcode</h2><p class="text-slate-500 text-sm">Enter your Staff ID to request a reset.</p></div>`+(msg?`<div class="card p-4 border-blue-300 bg-blue-50 text-sm">${esc(msg)}</div>`:`<form onsubmit="return doForgot(event)" class="space-y-4"><div><label class="text-sm font-semibold">Staff ID</label><input id="fid" class="inp mt-1 font-mono uppercase" placeholder="EMP-2026-W01" autocomplete="off"></div><div id="lerr" class="text-red-700 text-sm hidden"></div><button class="btn w-full py-3">Request Reset</button></form>`)+`<button class="text-sm text-slate-600 underline" onclick="screen='login';loginView()">Back to sign in</button>`)}
+async function doForgot(e){e.preventDefault();const id=$v('fid').trim().toUpperCase();if(!id)return lerr('Enter your Staff ID.');
+ try{const j=await api('forgot',{id},1);forgotView(j.master?'The Master Admin account cannot be reset online.':'Your reset request has been logged. For security verification, you cannot log in until a System Admin or Master Admin manually reviews and approves your request.')}catch(x){lerr(x.message)}return false}
+/* ---------- SHELL ---------- */
+function tabsFor(r){return r==='master'?[['roster','Roster'],['assistant','AI Assistant'],['import','Import Roster'],['leave','Leave'],['staff','Staff'],['depts','Departments'],['shifts','Shift Templates'],['attend','Attendance &amp; Zone'],['logs','System Logs']]
+ :r==='admin'?[['roster','Roster'],['assistant','AI Assistant'],['import','Import Roster'],['leave','Leave'],['attend','Attendance']]:[['mine','Personal Roster'],['general','General Roster'],['leave','Leave'],['attend','Clock In']]}
+function pendingHTML(){const p=db.pending||[];if(!p.length)return '';
+ return `<div class="rounded-xl border-2 border-red-300 bg-red-50 p-4"><div class="font-bold text-red-800">⚠ Pending Approvals (${p.length})</div><div class="text-sm text-red-700">These staff cannot sign in until a passcode reset is approved.</div>`+
+ p.map(s=>`<div class="flex flex-wrap items-center justify-between gap-2 bg-white rounded-lg border border-red-200 p-3 mt-2"><div><span class="font-semibold">${esc(s.name)}</span> <span class="font-mono text-sm text-slate-500">${s.id}</span><div class="text-xs text-slate-500">Requested ${esc(s.resetAt||'')}</div></div><button class="btn" onclick="approve('${s.id}')">Approve &amp; Issue Temporary Passcode</button></div>`).join('')+'</div>'}
+function noteHTML(){return note?`<div class="rounded-xl border-2 border-emerald-300 bg-emerald-50 p-4 space-y-2"><div class="font-bold text-emerald-900">${esc(note.title)}</div><textarea id="notetxt" readonly rows="3" class="inp text-sm">${esc(note.text)}</textarea><div class="flex gap-2"><button class="btn" onclick="copyNote()">Copy message</button><button class="btn2" onclick="note=null;render()">Dismiss</button></div><div class="text-xs text-slate-600">Share this with the staff member through a secure channel.</div></div>`:''}
+function copyNote(){const t=document.getElementById('notetxt');t.select();const ok=()=>toast('Message copied.');try{navigator.clipboard.writeText(t.value).then(ok,()=>{document.execCommand('copy');ok()})}catch(e){document.execCommand('copy');ok()}}
+async function approve(id){const s=db.staff.find(x=>x.id===id);try{const j=await api('approve',{id});note={title:`Reset approved for ${s.name} (${s.id})`,text:`Your passcode reset has been approved. Staff ID: ${s.id}, Temporary Passcode: ${j.temp}. You will be asked to set a new passcode when you log in.`};render()}catch(e){}}
+function render(){
+ if(!user)return loginView();
+ const tabs=tabsFor(user.role),my=notes(),rl={master:'Master Admin',admin:'Admin',worker:'Worker'}[user.role];
+ document.getElementById('app').innerHTML=`<header class="bg-slate-900 text-white sticky top-0 z-40"><div class="flex items-center justify-between px-4 py-3 gap-3">
+  <div class="flex items-center gap-2"><div class="w-8 h-8 rounded-lg bg-blue-600 grid place-items-center font-bold">+</div><span class="font-bold">MediRoster</span></div>
+  <div class="flex items-center gap-3 relative">
+   <button onclick="toggleBell()" class="relative btn2 !bg-slate-800 !border-slate-600 !text-white" aria-label="Notifications">🔔<span id="bb">${badgeHTML()}</span></button>
+   <div class="text-right leading-tight hidden sm:block"><div class="text-sm font-semibold">${esc(user.name)}${bdg(user,1)}</div><div class="text-xs text-slate-400">${rl} · ${user.id}</div></div>
+   <button onclick="signOut()" class="btn2 !bg-white !text-slate-900">Sign Out</button>
+   ${bell?`<div class="absolute right-0 top-12 w-96 max-w-[90vw] max-h-[75vh] overflow-y-auto bg-white text-slate-900 rounded-xl shadow-2xl border border-slate-200 p-3 space-y-2"><div class="flex justify-between items-center"><div class="font-bold text-sm">Notification Center</div><div class="flex gap-3"><button class="text-xs text-blue-700 font-semibold" onclick="enableAlerts()">Enable device alerts</button></div></div>${my.length?my.slice(0,15).map(n=>`<div class="text-sm rounded-lg p-2 border ${n.read?'bg-slate-50 border-slate-200':'bg-blue-50 border-blue-200'}">${esc(n.msg)}<div class="text-xs text-slate-500 mt-1">${n.t}</div></div>`).join(''):'<div class="text-sm text-slate-500">No alerts yet. An alert appears here when one of your shifts starts.</div>'}</div>`:''}
+  </div></div>
+  <nav class="flex gap-1 px-3 overflow-x-auto">${tabs.map(t=>`<button onclick="tab='${t[0]}';render()" class="px-4 py-2.5 text-sm whitespace-nowrap font-semibold border-b-2 ${tab===t[0]?'border-blue-500 text-white':'border-transparent text-slate-400 hover:text-white'}">${t[1]}</button>`).join('')}</nav></header>
+  <main class="p-4 lg:p-6 max-w-7xl mx-auto space-y-4">${user.role==='master'?statusHTML():''}${isMgr()?pendingHTML()+noteHTML()+(db.leavePending&&tab!=='leave'?`<div class="rounded-xl border-2 border-amber-300 bg-amber-50 p-3 flex flex-wrap items-center justify-between gap-2"><div class="font-semibold text-amber-900">${db.leavePending} leave request${db.leavePending===1?'':'s'} waiting for a decision</div><button class="btn" onclick="tab='leave';render()">Review</button></div>`:''):''}${view()}</main>`;
+ if(tab==='attend'&&user.role==='worker'&&loc.status==='idle')checkLoc();
+ if(tab==='staff'&&user.role==='master')loadStatus();
+ if(tab!=='leave')leaveData=null;else if(leaveData===null)loadLeave();
+ if(tab==='assistant'){const c=document.getElementById('chatbox');if(c)c.scrollTop=c.scrollHeight}
+}
+function view(){switch(tab){
+ case'roster':return rosterView(isMgr());case'general':return rosterView(false);case'mine':return mine();
+ case'staff':return staffView();case'leave':return leaveView();case'assistant':return assistantView();case'import':return importView();case'depts':return deptView();case'shifts':return shiftView();
+ case'attend':return user.role==='worker'?clockView():attendAdmin();case'logs':return logView()}return ''}
+
+/* ---------- ROSTER GRID ---------- */
+function legend(){return `<div class="flex flex-wrap gap-2 text-xs">${db.tpl.map(t=>`<span class="px-2 py-1 rounded-md font-semibold" style="background:${t.color}22;color:${t.color};border:1px solid ${t.color}55">${esc(t.name)} ${t.start}–${t.end}</span>`).join('')}</div>`}
+function onLeave(sid,dt){const v=db.roster[sid+'|'+dt];return Array.isArray(v)?v.includes('LEAVE'):v==='LEAVE'}
+function shifts(sid,dt){const v=db.roster[sid+'|'+dt];return (Array.isArray(v)?v:v?[v]:[]).map(tplOf).filter(Boolean)}
+function rosterView(edit){
+ const days=[...Array(7)].map((_,i)=>addDays(ws,i)),groups=(rdept&&rdept!=='ALL')?[rdept]:[...db.depts];
+ if((!rdept||rdept==='ALL')&&db.staff.some(s=>!db.depts.includes(s.dept)))groups.push('Unassigned');
+ let h=`<div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="text-xl font-bold">${edit?'Roster Planner':'General Roster'}</h2><p class="text-sm text-slate-500">${edit?'Tap any cell to choose one or more shifts for that day. No automatic checks are applied.':'Read-only facility schedule.'}</p></div>
+ <div class="flex flex-wrap items-center gap-2"><select class="inp !w-auto" onchange="setDept(this.value)"><option value="ALL" ${(!rdept||rdept==='ALL')?'selected':''}>All departments</option>${db.depts.map(d=>`<option ${d===rdept?'selected':''}>${esc(d)}</option>`).join('')}</select><button class="btn2" onclick="go(-7)">‹ Prev</button><button class="btn2" onclick="goToday()">This week</button><button class="btn2" onclick="go(7)">Next ›</button><button class="btn2 noprint" onclick="window.print()">Print</button></div></div>${legend()}
+ <div class="card overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 text-slate-600"><th class="text-left p-3 sticky left-0 bg-slate-50 min-w-[170px]">Staff</th>${days.map(d=>`<th class="p-2 text-center min-w-[104px] ${iso(d)===today()?'text-blue-700':''}">${d.toLocaleDateString('en-GB',{weekday:'short'})}<div class="font-normal text-xs">${d.getDate()} ${d.toLocaleDateString('en-GB',{month:'short'})}</div></th>`).join('')}</tr></thead><tbody>`;
+ groups.forEach(g=>{const ppl=db.staff.filter(s=>g==='Unassigned'?!db.depts.includes(s.dept):s.dept===g);if(!ppl.length)return;
+  h+=`<tr class="bg-slate-100"><td colspan="8" class="px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-slate-600">${esc(g)}</td></tr>`;
+  ppl.forEach(s=>{h+=`<tr class="border-t border-slate-100 ${s.id===user.id?'bg-blue-50/60':''}"><td class="p-2 sticky left-0 ${s.id===user.id?'bg-blue-50':'bg-white'}"><div class="font-semibold">${esc(s.name)}${bdg(s)}</div><div class="text-xs text-slate-500">${s.id}</div></td>`+
+   days.map(d=>{const dt=iso(d),L=shifts(s.id,dt);
+    const inner=L.length?L.map(t=>`<div class="rounded-lg px-1 py-1 mb-1 text-center text-xs font-bold" style="background:${t.color}22;color:${t.color};border:1px solid ${t.color}55">${esc(t.name)}<div class="font-normal">${t.start}–${t.end}</div></div>`).join(''):onLeave(s.id,dt)?`<div class="rounded-lg py-3 text-center text-xs font-bold bg-slate-200 text-slate-600 border border-slate-300">On leave</div>`:`<div class="rounded-lg py-3 text-center text-slate-300 ${edit?'border border-dashed border-slate-300':''}">${edit?'+':'–'}</div>`;
+    return `<td class="p-1">${edit?`<button class="w-full" onclick="pick(event,'${s.id}','${dt}')">${inner}</button>`:inner}</td>`}).join('')+'</tr>'});});
+ return h+`</tbody><tfoot><tr class="border-t-2 border-slate-300 bg-slate-50 text-xs font-semibold text-slate-600"><td class="p-2 sticky left-0 bg-slate-50">Staff on duty</td>${days.map(d=>`<td class="p-2 text-center">${db.staff.filter(s=>shifts(s.id,iso(d)).length).length}</td>`).join('')}</tr></tfoot></table></div>`}
+let popFor=null;
+function pick(e,sid,dt){e.stopPropagation();if(!isMgr())return;const r=e.currentTarget.getBoundingClientRect();popFor={sid,dt,left:r.left,bottom:r.bottom};drawPop()}
+function drawPop(){const p=document.getElementById('pop');if(!popFor)return;const {sid,dt}=popFor,s=db.staff.find(x=>x.id===sid),on=new Set(shifts(sid,dt).map(t=>t.id)),lv=onLeave(sid,dt),head=`<div class="text-xs text-slate-500 px-2 pb-1">${esc(s.name)} · ${fmtD(dt)}</div>`;
+ if(lv&&user.role!=='master')p.innerHTML=head+`<div class="px-3 py-2 text-sm">Approved leave. Only the Master Admin can change this day.</div><div class="px-2"><button onclick="closePop()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold">Done</button></div>`;
+ else p.innerHTML=head+(lv?'<div class="px-3 pb-1 text-xs text-slate-600">On leave. Ticking a shift replaces the leave.</div>':'<div class="px-2 pb-1 text-xs text-slate-500">Tick every shift this person works that day</div>')+db.tpl.map(t=>`<button onclick="toggleShift('${t.id}')" class="w-full flex items-center gap-2 text-left px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-semibold" style="color:${t.color}"><span class="inline-block w-4 text-center">${on.has(t.id)?'☑':'☐'}</span><span>${esc(t.name)} <span class="font-normal text-slate-500">${t.start}–${t.end}</span></span></button>`).join('')+(user.role==='master'?`<button onclick="markLeaveCell(${lv?'false':'true'})" class="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-semibold text-slate-700">${lv?'Remove leave (day off)':'Mark as day off (leave)'}</button>`:'')+`<div class="flex gap-2 border-t border-slate-200 mt-1 pt-1"><button onclick="clearShifts()" class="grow text-left px-3 py-2 rounded-lg hover:bg-red-50 text-sm font-semibold text-red-700">Clear all</button><button onclick="closePop()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold">Done</button></div>`;
+ p.classList.remove('hidden');p.style.left=Math.max(8,Math.min(popFor.left,innerWidth-232))+'px';p.style.top=Math.max(8,Math.min(popFor.bottom+4,innerHeight-p.offsetHeight-8))+'px'}
+function closePop(){popFor=null;document.getElementById('pop').classList.add('hidden')}
+async function toggleShift(tid){const {sid,dt}=popFor,cur=shifts(sid,dt).map(t=>t.id),next=cur.includes(tid)?cur.filter(x=>x!==tid):[...cur,tid];next.sort((a,b)=>tplOf(a).start.localeCompare(tplOf(b).start));await setShifts(sid,dt,next)}
+async function markLeaveCell(on){const {sid,dt}=popFor;try{await api('markLeave',{sid,from:dt,to:dt,on});render();drawPop()}catch(e){}}
+async function clearShifts(){await setShifts(popFor.sid,popFor.dt,[])}
+async function setShifts(sid,dt,tids){try{await api('assign',{sid,dt,tids});const k=sid+'|'+dt;if(tids.length)db.roster[k]=tids;else delete db.roster[k];render();drawPop()}catch(e){}}
+document.addEventListener('click',e=>{const p=document.getElementById('pop');if(!p.contains(e.target))p.classList.add('hidden')});
+function mine(){const items=[];for(let d=0;d<14;d++){const dt=iso(addDays(new Date(today()+'T00:00'),d));items.push({dt,L:shifts(user.id,dt),lv:onLeave(user.id,dt),d})}
+ return `<div><h2 class="text-xl font-bold">My Personal Roster${bdg(user)}</h2><p class="text-sm text-slate-500">Your assigned shifts for the next 14 days.</p></div><div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">`+
+ items.map(i=>`<div class="card p-4 ${i.d===0?'ring-2 ring-blue-600':''}"><div class="text-sm text-slate-500">${fmtD(i.dt)}${i.d===0?' · Today':''}</div>${i.lv?'<div class="text-lg font-bold mt-1 text-slate-600">On leave</div>':i.L.length?i.L.map(t=>`<div class="mt-1"><span class="text-lg font-bold" style="color:${t.color}">${esc(t.name)} Shift</span> <span class="text-slate-600">${t.start} – ${t.end}</span></div>`).join(''):'<div class="text-slate-400 mt-1">Day off</div>'}</div>`).join('')+'</div>'}
+
+/* ---------- STAFF (master) ---------- */
+function staffRows(){const q=sq.toLowerCase(),all=db.staff.filter(s=>!q||(s.name+' '+s.id+' '+(s.email||'')+' '+(s.designation||'')+' '+s.dept).toLowerCase().includes(q)),pages=Math.max(1,Math.ceil(all.length/25));if(spage>=pages)spage=pages-1;if(spage<0)spage=0;return {all,pages,rows:all.slice(spage*25,spage*25+25)}}
+function setQ(v){sq=v;spage=0;render()}
+function pg(n){spage+=n;render()}
+function staffView(){const {all,pages,rows}=staffRows();return `<h2 class="text-xl font-bold">Staff Management <span class="text-sm font-normal text-slate-500">(${db.staff.length} staff)</span></h2>
+ <div class="card p-4"><div class="font-bold mb-3">Add staff member</div><div class="grid sm:grid-cols-3 gap-3">
+  <div><label class="text-xs font-semibold">Full name</label><input id="nn" class="inp" placeholder="e.g. Anita Rao"></div>
+  <div><label class="text-xs font-semibold">Permission tier</label><select id="nr" class="inp"><option value="worker">Worker</option><option value="admin">Admin</option></select></div>
+  <div><label class="text-xs font-semibold">Designation (e.g., Director, Chief of Surgery, Senior Consultant)</label><input id="ndes" class="inp" placeholder="Optional"></div>
+  <div><label class="text-xs font-semibold">Email address</label><input id="ne" type="email" class="inp" placeholder="name@hospital.com"></div>
+  <div><label class="text-xs font-semibold">Department</label><select id="nd" class="inp">${db.depts.map(d=>`<option>${esc(d)}</option>`).join('')}</select></div></div>
+  <button class="btn mt-3" onclick="addStaff()">Create account &amp; send welcome email</button></div>
+ <div class="card p-4 space-y-2"><div class="font-bold">Add many people at once</div><div class="text-xs text-slate-500">One person per line: Name, Email, Worker or Admin, Department, Designation (last two optional). Up to 200 lines at a time. Welcome emails are sent automatically, 20 every 5 minutes.</div>
+  <textarea id="bulk" rows="4" class="inp text-sm font-mono" placeholder="Anita Rao, anita@gmail.com, Worker, ICU, Staff Nurse"></textarea>
+  <div class="flex gap-2"><button class="btn2" onclick="bulkAdd()">Import list</button><button class="btn2" onclick="exportStaff()">Download staff list (CSV)</button></div></div>
+ <div class="card p-3 flex flex-wrap items-center gap-3"><input class="inp !w-72" placeholder="Search name, ID, email, department" value="${esc(sq)}" onchange="setQ(this.value)"><div class="text-sm text-slate-500">${all.length} shown · page ${spage+1} of ${pages}</div><button class="btn2" ${spage<=0?'disabled':''} onclick="pg(-1)">‹ Prev</button><button class="btn2" ${spage>=pages-1?'disabled':''} onclick="pg(1)">Next ›</button></div>
+ <div class="card overflow-x-auto"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-slate-600"><tr><th class="p-3">Name</th><th>Designation</th><th>Department</th><th>Staff ID</th><th>Email</th><th>Permission</th><th>Status</th><th></th></tr></thead><tbody>`+
+ rows.map(s=>{const m=s.role==='master',st=stat[s.id];return `<tr class="border-t border-slate-100 align-top"><td class="p-3"><div class="font-semibold">${esc(s.name)}</div><div class="text-xs text-slate-500">${esc(s.dept)}</div></td>
+ <td class="pr-2"><input class="inp !py-1 min-w-[150px]" value="${esc(s.designation)}" placeholder="No badge" onchange="setDes('${s.id}',this.value)"></td>
+ <td class="pr-2"><select class="inp !py-1 min-w-[120px]" onchange="setStaffDept('${s.id}',this.value)">${(db.depts.includes(s.dept)?db.depts:[...db.depts,s.dept]).map(d=>`<option value="${esc(d)}" ${d===s.dept?'selected':''}>${esc(d)}</option>`).join('')}</select></td>
+ <td class="font-mono pr-2">${s.id}</td><td class="text-xs pr-2">${esc(s.email)}</td>
+ <td class="pr-2">${m?'<span class="px-2 py-1 rounded-md bg-slate-900 text-white text-xs font-bold">Master Admin</span>':`<select class="inp !py-1" onchange="setRole('${s.id}',this.value)"><option value="worker" ${s.role==='worker'?'selected':''}>Worker</option><option value="admin" ${s.role==='admin'?'selected':''}>Admin</option></select>`}</td>
+ <td class="pr-2 text-xs">${m?'<span class="text-emerald-700 font-semibold">Active</span>':!st?'…':st.reset?'<span class="text-red-700 font-semibold">Reset pending</span>':st.setup?`<span class="text-amber-700 font-semibold">Setup pending</span><div>Temp: <span class="font-mono">${esc(st.temp||'')}</span></div>`:'<span class="text-emerald-700 font-semibold">Active</span>'}</td>
+ <td class="pr-3 text-right">${m?'':`<button class="text-red-700 text-xs font-semibold" onclick="delStaff('${s.id}')">Remove</button>`}</td></tr>`}).join('')+'</tbody></table></div>'}
+async function loadStatus(){const ids=staffRows().rows.filter(s=>s.role!=='master'&&!stat[s.id]).map(s=>s.id);if(!ids.length)return;
+ try{const j=await api('staffStatus',{ids},1);ids.forEach(id=>{stat[id]=j.status[id]||{}});render()}catch(e){ids.forEach(id=>{stat[id]={}})}}
+async function bulkAdd(){const rows=$v('bulk').split(/\n/).map(l=>l.trim()).filter(Boolean).map(l=>{const c=l.split(/[,\t]/).map(x=>x.trim());return {name:c[0],email:c[1],role:/^admin/i.test(c[2]||'')?'admin':'worker',dept:c[3]||'',designation:c[4]||''}});
+ if(!rows.length)return toast('Paste at least one line.');if(rows.length>200)return toast('Import up to 200 people at a time.');
+ if(!confirm('Create '+rows.length+' accounts? Welcome emails will be sent automatically.'))return;
+ try{const j=await api('bulkAdd',{rows});render();toast(j.added+' accounts created.'+(j.skipped.length?' Skipped: '+j.skipped.slice(0,3).join('; '):''))}catch(e){}}
+function exportStaff(){const rows=[['Name','Staff ID','Email','Permission','Designation','Department'],...db.staff.map(s=>[s.name,s.id,s.email||'',s.role,s.designation||'',s.dept])];
+ const csv=rows.map(r=>r.map(x=>'"'+String(x).replace(/"/g,'""')+'"').join(',')).join('\n'),a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='mediroster-staff.csv';a.click()}
+async function setDes(id,v){try{await api('setDes',{id,v})}catch(e){}render()}
+async function setStaffDept(id,v){try{await api('setStaffDept',{id,dept:v})}catch(e){}render()}
+async function setRole(id,r){try{await api('setRole',{id,r})}catch(e){}render()}
+async function addStaff(){const n=$v('nn').trim(),em=$v('ne').trim();
+ if(!n)return toast('Enter the full name.');if(!/^\S+@\S+\.\S+$/.test(em))return toast('Enter a valid email address.');
+ try{const j=await api('addStaff',{name:n,email:em,role:$v('nr'),designation:$v('ndes').trim(),dept:$v('nd')});render();toast(j.emailed?'Account created. Welcome email sent to '+em+'.':'Account created, but the email could not be sent. See the status bar above.')}catch(e){}}
+async function delStaff(id){const s=db.staff.find(x=>x.id===id);if(!s||!confirm('Remove '+s.name+'? Their shifts are deleted too.'))return;try{await api('delStaff',{id});render()}catch(e){}}
+/* ---------- DEPTS / SHIFTS / LOGS ---------- */
+function deptView(){return `<h2 class="text-xl font-bold">Departments</h2><div class="card p-4 flex gap-3"><input id="dn" class="inp" placeholder="New department name"><button class="btn whitespace-nowrap" onclick="addDept()">Add</button></div>
+ <div class="card divide-y divide-slate-100">`+db.depts.map((d,i)=>`<div class="flex items-center justify-between p-3"><div><span class="font-semibold">${esc(d)}</span> <span class="text-sm text-slate-500">· ${db.staff.filter(s=>s.dept===d).length} staff</span></div><button class="text-red-700 text-sm font-semibold" onclick="delDept(${i})">Delete</button></div>`).join('')+'</div>'}
+async function addDept(){const n=$v('dn').trim();if(!n)return toast('Enter a name.');try{await api('addDept',{name:n});render()}catch(e){}}
+async function delDept(i){const n=db.depts[i];if(!confirm('Delete '+n+'? Its staff move to "Unassigned".'))return;try{await api('delDept',{name:n});render()}catch(e){}}
+function shiftView(){return `<h2 class="text-xl font-bold">Global Shift Templates</h2><p class="text-sm text-slate-500">Templates can be placed on any day, for any staff member.</p>
+ <div class="card p-4 grid sm:grid-cols-5 gap-3 items-end"><div class="sm:col-span-2"><label class="text-xs font-semibold">Name</label><input id="sn" class="inp" placeholder="e.g. Split"></div><div><label class="text-xs font-semibold">Start</label><input id="ss" type="time" class="inp" value="07:00"></div><div><label class="text-xs font-semibold">End</label><input id="se" type="time" class="inp" value="15:00"></div><div><label class="text-xs font-semibold">Colour</label><input id="sc" type="color" class="inp !p-1 h-10" value="#047857"></div>
+ <button class="btn sm:col-span-5" onclick="addTpl()">Save template</button></div>
+ <div class="card divide-y divide-slate-100">`+db.tpl.map(t=>`<div class="flex items-center justify-between p-3"><div><span class="inline-block w-3 h-3 rounded-full mr-2" style="background:${t.color}"></span><span class="font-semibold">${esc(t.name)}</span> <span class="text-slate-500 text-sm">${t.start}–${t.end}</span></div><button class="text-red-700 text-sm font-semibold" onclick="delTpl('${t.id}')">Delete</button></div>`).join('')+'</div>'}
+async function addTpl(){const n=$v('sn').trim();if(!n)return toast('Enter a template name.');try{await api('addTpl',{name:n,start:$v('ss'),end:$v('se'),color:$v('sc')});render()}catch(e){}}
+async function delTpl(id){const t=tplOf(id);if(!confirm('Delete '+t.name+'? Shifts using it are cleared.'))return;try{await api('delTpl',{id});render()}catch(e){}}
+function logView(){return `<h2 class="text-xl font-bold">System Logs</h2><div class="card overflow-x-auto"><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-slate-600"><tr><th class="p-3">Time</th><th>User</th><th>Action</th></tr></thead><tbody>`+(db.logs.length?db.logs.map(l=>`<tr class="border-t border-slate-100 align-top"><td class="p-3 whitespace-nowrap text-slate-500">${l.t}</td><td class="pr-3 font-semibold whitespace-nowrap">${esc(l.who)}</td><td class="pr-3">${esc(l.msg)}</td></tr>`).join(''):'<tr><td class="p-3 text-slate-500" colspan="3">No activity yet.</td></tr>')+'</tbody></table></div>'}
+
+/* ---------- ATTENDANCE ---------- */
+function dist(a,b,c,d){const R=6371e3,r=x=>x*Math.PI/180,p=r(c-a),q=r(d-b),h=Math.sin(p/2)**2+Math.cos(r(a))*Math.cos(r(c))*Math.sin(q/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+function checkLoc(){const z=db.zone;loc.status='loading';
+ if(!navigator.geolocation){loc.status='err';loc.msg='Location is not supported in this browser.';return render()}
+ navigator.geolocation.getCurrentPosition(p=>{loc.lat=p.coords.latitude;loc.lng=p.coords.longitude;loc.d=Math.round(dist(loc.lat,loc.lng,z.lat,z.lng));loc.status='ok';if(tab==='attend')render()},e=>{loc.status='err';loc.msg='Could not read your location ('+e.message+'). Allow location access in your browser and try again.';if(tab==='attend')render()},{enableHighAccuracy:true,timeout:10000})}
+function setMode(m){loc={mode:m,status:'idle'};render()}
+function clockView(){const z=db.zone,inZ=loc.status==='ok'&&loc.d<=z.radius,rec=db.att.find(a=>a.id===user.id&&a.date===today()),t=shifts(user.id,today());
+ return `<h2 class="text-xl font-bold">Geofenced Attendance</h2>
+ <div class="card p-5 space-y-4"><div class="flex flex-wrap justify-between gap-3"><div><div class="text-sm text-slate-500">Designated zone</div><div class="font-semibold">${esc(z.name)} · ${z.radius} m radius</div></div>
+  <div><div class="text-sm text-slate-500">Today</div><div class="font-semibold">${onLeave(user.id,today())?'On leave today':t.length?t.map(x=>esc(x.name)+' '+x.start+'–'+x.end).join(', '):'No shift assigned'}</div></div>
+  </div>
+  <div class="text-center py-4">${rec?`<div class="inline-block rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-800 px-8 py-6"><div class="text-2xl font-bold">✓ Clocked in at ${rec.time}</div><div class="text-sm">Attendance recorded for today.</div></div>`:
+  `<button ${inZ?'':'disabled'} onclick="clockIn()" class="rounded-2xl px-10 py-8 text-2xl font-bold text-white ${inZ?'bg-emerald-600 hover:bg-emerald-700':'bg-slate-400 cursor-not-allowed'}">${loc.status==='loading'?'Locating…':inZ?'Tap to Clock In':'Clock In Locked'}</button>`}
+  <div class="mt-3 text-sm ${inZ||rec?'text-emerald-700':'text-red-700'}">${loc.status==='ok'?(inZ?`You are inside the hospital zone (${loc.d} m from centre).`:`Location error: you are ${loc.d>1000?(loc.d/1000).toFixed(1)+' km':loc.d+' m'} from the hospital zone. Move within ${z.radius} m to clock in.`):loc.status==='err'?loc.msg:'Checking location…'}</div>
+  <button class="btn2 mt-3" onclick="loc.status='idle';render()">Re-check location</button></div></div>`+histTable(db.att.filter(a=>a.id===user.id),'My attendance history')}
+async function clockIn(){if(!(loc.status==='ok'&&loc.d<=db.zone.radius))return toast('Outside the hospital zone.');try{await api('clockIn',{lat:loc.lat,lng:loc.lng});render();toast('Clock-in recorded.')}catch(e){}}
+function attPicker(){return `<div class="card p-4 flex items-end gap-3"><div><label class="text-xs font-semibold">Show clock-ins for date</label><input type="date" class="inp" value="${attDate||today()}" onchange="loadAtt(this.value)"></div></div>`}
+async function loadAtt(d){attDate=d;if(d===today()){attRows=null;return render()}try{const j=await api('attDay',{date:d});attRows=j.rows}catch(e){}render()}
+function histTable(a,t){return `<div class="card overflow-x-auto"><div class="p-3 font-bold">${t} <span class="font-normal text-slate-500">(${a.length})</span></div><table class="w-full text-sm"><thead class="bg-slate-50 text-left text-slate-600"><tr><th class="p-3">Date</th><th>Staff</th><th>Time</th><th>Distance</th></tr></thead><tbody>`+(a.length?a.slice().sort((x,y)=>(y.date+y.time).localeCompare(x.date+x.time)).slice(0,300).map(r=>`<tr class="border-t border-slate-100"><td class="p-3">${fmtD(r.date)}</td><td>${esc(r.name)}</td><td>${r.time}</td><td>${r.d} m</td></tr>`).join(''):'<tr><td class="p-3 text-slate-500" colspan="4">No records yet.</td></tr>')+'</tbody></table></div>'}
+function attendAdmin(){const z=db.zone,m=user.role==='master';
+ return `<h2 class="text-xl font-bold">${m?'Attendance &amp; Hospital Zone':'Attendance Records'}</h2>`+(m?`<div class="card p-4 grid sm:grid-cols-4 gap-3 items-end"><div class="sm:col-span-4 text-sm text-slate-500">Workers can only clock in inside this circle.</div>
+ <div><label class="text-xs font-semibold">Zone name</label><input id="zn" class="inp" value="${esc(z.name)}"></div><div><label class="text-xs font-semibold">Latitude</label><input id="zla" class="inp" value="${z.lat}"></div><div><label class="text-xs font-semibold">Longitude</label><input id="zlo" class="inp" value="${z.lng}"></div><div><label class="text-xs font-semibold">Radius (metres)</label><input id="zr" class="inp" value="${z.radius}"></div>
+ <button class="btn" onclick="saveZone()">Save zone</button><button class="btn2" onclick="useHere()">Use my current location</button></div>`:'')+attPicker()+histTable(attRows||db.att,'Clock-ins on '+(attDate||today()))}
+async function saveZone(){try{await api('saveZone',{name:$v('zn'),lat:$v('zla'),lng:$v('zlo'),radius:$v('zr')});toast('Zone saved.');render()}catch(e){}}
+function useHere(){if(!navigator.geolocation)return toast('Geolocation unavailable here.');navigator.geolocation.getCurrentPosition(p=>{document.getElementById('zla').value=p.coords.latitude.toFixed(6);document.getElementById('zlo').value=p.coords.longitude.toFixed(6);toast('Coordinates filled. Press Save zone.')},e=>toast('GPS blocked: '+e.message+'. Type coordinates manually.'),{timeout:8000})}
+
+/* ---------- LEAVE ---------- */
+function daysText(days){const d=[...days].sort(),runs=[];d.forEach(x=>{const l=runs[runs.length-1];if(l&&Date.parse(x)-Date.parse(l[1])===864e5)l[1]=x;else runs.push([x,x])});return runs.map(r=>r[0]===r[1]?fmtD(r[0]):fmtD(r[0])+' to '+fmtD(r[1])).join(', ')}
+const LV_CHIP={pending:['Waiting','bg-amber-100 text-amber-800'],approved:['Approved','bg-emerald-100 text-emerald-800'],partial:['Partly approved','bg-blue-100 text-blue-800'],rejected:['Not approved','bg-red-100 text-red-800'],cancelled:['Cancelled','bg-slate-200 text-slate-600']};
+async function loadLeave(){try{leaveData=await api('leaveList',{},1)}catch(e){leaveData={mine:[],queue:[]}}render()}
+function leaveView(){const L=leaveData,M=user.role==='master';let h='<h2 class="text-xl font-bold">Leave</h2>';
+ if(!L)return h+'<div class="text-sm text-slate-500">Loading...</div>';
+ if(!M)h+=`<div class="card p-4 space-y-2"><div class="font-bold">Apply for leave</div><div class="text-sm text-slate-500">${user.role==='admin'?'Your request goes to the Master Admin.':'Your request goes to an Admin or the Master Admin. They can approve all of it or only some days.'}</div>
+  <div class="flex flex-wrap gap-3 items-end"><div><label class="text-xs font-semibold">First day</label><input id="lvFrom" type="date" class="inp" value="${today()}" min="${today()}"></div><div><label class="text-xs font-semibold">Last day</label><input id="lvTo" type="date" class="inp" value="${today()}" min="${today()}"></div><div class="grow min-w-[200px]"><label class="text-xs font-semibold">Reason (optional)</label><input id="lvWhy" class="inp" maxlength="200"></div><button class="btn" onclick="leaveApply()">Send request</button></div></div>`;
+ if(isMgr())h+=`<div class="card p-4 space-y-3"><div class="font-bold">Waiting for your decision (${L.queue.length})</div>`+(L.queue.length?L.queue.map(r=>`<div class="rounded-lg border border-slate-200 p-3 space-y-2"><div class="flex flex-wrap justify-between gap-2"><div><span class="font-semibold">${esc(r.name)}</span> <span class="text-xs text-slate-500">${esc(r.dept||'')} · ${r.role==='admin'?'Admin':'Worker'}</span></div><div class="text-xs text-slate-500">${r.days.length} day${r.days.length===1?'':'s'}</div></div>${r.reason?`<div class="text-sm text-slate-600">"${esc(r.reason)}"</div>`:''}
+  <div class="text-xs text-slate-500">Tick the days you approve:</div><div class="flex flex-wrap gap-2">${r.days.map(d=>`<label class="text-sm rounded-lg border border-slate-300 px-2 py-1 bg-slate-50"><input type="checkbox" id="lv_${r.rid}_${d}" checked> ${fmtD(d)}</label>`).join('')}</div>
+  <div class="flex gap-2"><button class="btn" onclick="leaveDecide('${r.rid}','${r.sid}',true)">Approve ticked days</button><button class="btn2 text-red-700" onclick="leaveDecide('${r.rid}','${r.sid}',false)">Reject all</button></div></div>`).join(''):'<div class="text-sm text-slate-500">No requests waiting.</div>')+'</div>';
+ if(M)h+=`<div class="card p-4 space-y-2"><div class="font-bold">Mark days off directly</div><div class="text-sm text-slate-500">For any staff member. Existing shifts on those days are replaced by "On leave". You can also do this from a roster cell.</div>
+  <div class="flex flex-wrap gap-3 items-end"><div class="grow min-w-[220px]"><label class="text-xs font-semibold">Name or Staff ID</label><input id="mlWho" class="inp" placeholder="e.g. Anita Rao"></div><div><label class="text-xs font-semibold">From</label><input id="mlFrom" type="date" class="inp" value="${today()}"></div><div><label class="text-xs font-semibold">To</label><input id="mlTo" type="date" class="inp" value="${today()}"></div><button class="btn" onclick="markLeaveForm(true)">Mark day(s) off</button><button class="btn2" onclick="markLeaveForm(false)">Remove leave</button></div></div>`;
+ if(!M)h+=`<div class="card p-4 space-y-2"><div class="font-bold">My requests</div>`+(L.mine.length?L.mine.map(r=>{const c=LV_CHIP[r.status]||LV_CHIP.pending;return `<div class="rounded-lg border border-slate-200 p-3 flex flex-wrap justify-between gap-2"><div><div class="text-sm font-semibold">${daysText(r.days)}</div>${r.reason?`<div class="text-xs text-slate-500">${esc(r.reason)}</div>`:''}${(r.status==='approved'||r.status==='partial')?`<div class="text-xs text-slate-600">Approved: ${daysText(r.approvedDays)}${r.decidedBy?' (by '+esc(r.decidedBy)+')':''}</div>`:''}</div><div class="flex items-center gap-2"><span class="text-xs font-semibold px-2 py-1 rounded-md ${c[1]}">${c[0]}</span>${r.status==='pending'?`<button class="text-xs text-red-700 font-semibold" onclick="leaveCancel('${r.rid}')">Cancel</button>`:''}</div></div>`}).join(''):'<div class="text-sm text-slate-500">No requests yet.</div>')+'</div>';
+ return h}
+async function leaveApply(){const f=$v('lvFrom'),t=$v('lvTo');if(!f||!t||t<f)return toast('Choose valid dates.');try{await api('leaveApply',{from:f,to:t,reason:$v('lvWhy')});toast('Request sent.');leaveData=null;loadLeave()}catch(e){}}
+async function leaveCancel(rid){try{await api('leaveCancel',{rid});leaveData=null;loadLeave()}catch(e){}}
+async function leaveDecide(rid,sid,yes){const r=leaveData.queue.find(x=>x.rid===rid);if(!r)return;const approve=yes?r.days.filter(d=>{const e=document.getElementById('lv_'+rid+'_'+d);return e&&e.checked}):[];
+ if(yes&&!approve.length)return toast('Tick at least one day, or press Reject all.');
+ try{await api('leaveDecide',{sid,rid,approve});toast(yes?approve.length+' of '+r.days.length+' days approved.':'Request rejected.');leaveData=null;loadLeave()}catch(e){}}
+async function markLeaveForm(on){const f=findStaff($v('mlWho'),staffIndex());if(f.err)return toast(f.err==='empty'?'Type a name or Staff ID.':f.err);
+ try{await api('markLeave',{sid:f.s.id,from:$v('mlFrom'),to:$v('mlTo'),on});toast(on?f.s.name+' marked on leave.':'Leave removed.');render()}catch(e){}}
+
+/* ---------- AI ASSISTANT ---------- */
+const EXAMPLES=['Assign [name] to the Morning shift for the next 7 days','Give [name] Morning and Evening shifts next Monday','Clear all shifts for [name] this week','Put everyone in ICU on Night shift on weekdays next week'];
+function previewHTML(pv,max){if(!pv)return '';const rows=(pv.sample||[]).slice(0,max||60);
+ return `<div class="text-sm font-semibold">${pv.total} change${pv.total===1?'':'s'} for ${pv.people} ${pv.people===1?'person':'people'}${pv.from?` (${fmtD(pv.from)} to ${fmtD(pv.to)})`:''}${pv.noop?` · ${pv.noop} already as requested`:''}</div>`+
+ (rows.length?`<div class="overflow-x-auto mt-2"><table class="w-full text-xs"><thead class="text-left text-slate-500"><tr><th class="py-1 pr-3">Staff</th><th class="pr-3">Date</th><th class="pr-3">Now</th><th>After</th></tr></thead><tbody>${rows.map(r=>`<tr class="border-t border-slate-100"><td class="py-1 pr-3">${esc(r.name)}</td><td class="pr-3 whitespace-nowrap">${fmtD(r.dt)}</td><td class="pr-3 text-slate-500">${r.before.length?esc(r.before.join(' + ')):'none'}</td><td class="font-semibold">${r.after.length?esc(r.after.join(' + ')):'day off'}</td></tr>`).join('')}</tbody></table></div>`:'')+
+ (pv.total>rows.length?`<div class="text-xs text-slate-500 mt-1">...and ${pv.total-rows.length} more</div>`:'')+
+ ((pv.problems||[]).length?`<div class="mt-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2"><b>Skipped or unclear:</b><br>${pv.problems.map(esc).join('<br>')}${pv.moreProblems?`<br>...and ${pv.moreProblems} more`:''}</div>`:'')}
+function assistantView(){
+ const msgs=chat.map((m,i)=>m.role==='user'?`<div class="flex justify-end"><div class="max-w-[85%] rounded-2xl bg-blue-700 text-white px-4 py-2 text-sm">${esc(m.text)}</div></div>`
+  :`<div class="flex"><div class="max-w-[95%] rounded-2xl bg-white border border-slate-200 px-4 py-3 text-sm space-y-2"><div>${esc(m.text)}</div>${m.plan?previewHTML(m.plan.preview,40):''}${m.plan&&m.plan.preview.total&&!m.plan.state?`<div class="flex gap-2 pt-1"><button class="btn" onclick="aiConfirm(${i})">Confirm and save ${m.plan.preview.total} change${m.plan.preview.total===1?'':'s'}</button><button class="btn2" onclick="aiCancel(${i})">Cancel</button></div>`:''}${m.plan&&m.plan.state==='saving'?'<div class="text-xs text-slate-500">Saving...</div>':''}${m.plan&&m.plan.state==='done'?'<div class="text-xs text-emerald-700 font-semibold">Saved.</div>':''}${m.plan&&m.plan.state==='cancelled'?'<div class="text-xs text-slate-500">Cancelled. Nothing was saved.</div>':''}</div></div>`).join('');
+ return `<h2 class="text-xl font-bold">AI Assistant</h2><p class="text-sm text-slate-500">Tell me what to change in plain English. I show you exactly what will change, and nothing is saved until you press Confirm.</p>
+ ${db.ai?'':'<div class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm">The AI is not switched on yet. The Master Admin needs to add the AI_API_KEY setting in Netlify (see the guide, Part F).</div>'}
+ <div id="chatbox" class="card p-4 space-y-3 overflow-y-auto" style="max-height:55vh;min-height:180px">${msgs||'<div class="text-sm text-slate-500">Try an example below (replace [name] with a real name), or type your own request.</div>'}${chatBusy?'<div class="text-sm text-slate-500">Thinking...</div>':''}</div>
+ <div class="flex flex-wrap gap-2">${EXAMPLES.map((x,i)=>`<button class="btn2 text-xs" onclick="useExample(${i})">${esc(x)}</button>`).join('')}</div>
+ <div class="card p-3 flex gap-2 items-end"><textarea id="aiq" rows="2" class="inp" placeholder="e.g. Assign Anita Rao to the Morning shift for the next 7 days" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();aiSend()}"></textarea><button class="btn" ${chatBusy?'disabled':''} onclick="aiSend()">Send</button></div>
+ ${lastUndo?`<div><button class="btn2" onclick="aiUndo()">Undo the last saved change (${lastUndo.length} day${lastUndo.length===1?'':'s'})</button></div>`:''}`}
+function useExample(i){const q=document.getElementById('aiq');q.value=EXAMPLES[i];if(q.focus)q.focus()}
+async function aiSend(){const q=document.getElementById('aiq'),text=((q&&q.value)||'').trim();if(!text||chatBusy)return;
+ const hist=chat.slice(-6).map(m=>({role:m.role,text:m.text}));chat.push({role:'user',text});chatBusy=true;render();
+ try{const j=await api('aiPlan',{message:text,history:hist},1);chat.push({role:'ai',text:j.reply||'(no reply)',plan:j.preview?{preview:j.preview,changes:j.changes,note:text}:null})}
+ catch(e){chat.push({role:'ai',text:'Sorry: '+e.message})}
+ chatBusy=false;render()}
+async function aiConfirm(i){const m=chat[i];if(!m||!m.plan||m.plan.state)return;m.plan.state='saving';render();
+ try{const j=await api('applyChanges',{changes:m.plan.changes,source:'ai',note:m.plan.note},1);m.plan.state='done';lastUndo=j.undo&&j.undo.length?j.undo:null;chat.push({role:'ai',text:`Done. ${j.applied} day${j.applied===1?'':'s'} updated and recorded in the System Logs. The Roster tab now shows it.`})}
+ catch(e){m.plan.state=null;chat.push({role:'ai',text:'Could not save: '+e.message})}render()}
+function aiCancel(i){if(chat[i]&&chat[i].plan)chat[i].plan.state='cancelled';render()}
+async function aiUndo(){if(!lastUndo||!confirm('Put the roster back the way it was before the last change?'))return;
+ try{await api('applyChanges',{changes:lastUndo,source:'undo',note:'Undo'},1);lastUndo=null;chat.push({role:'ai',text:'Undone. The roster is back the way it was.'})}catch(e){chat.push({role:'ai',text:'Could not undo: '+e.message})}render()}
+
+/* ---------- IMPORT ROSTER (Excel, CSV, PDF or pasted text) ---------- */
+const XLSX_URL='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',PDF_URL='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',PDF_WORKER='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const loadedJS={};
+function loadScript(u){return loadedJS[u]||(loadedJS[u]=new Promise((res,rej)=>{const s=document.createElement('script');s.src=u;s.onload=res;s.onerror=()=>{delete loadedJS[u];rej(new Error('Could not load a helper tool. Check your internet, or save the file as CSV / paste the table instead.'))};document.head.appendChild(s)}))}
+function gptPrompt(){const dates=[...Array(7)].map((_,i)=>iso(addDays(ws,i)));return `Create a roster as a plain CSV table (no explanations, no markdown). Header row: Staff ID,Name,${dates.join(',')}\nOne row per staff member from the list I give you. Each cell holds shift names exactly as spelled here: ${db.tpl.map(t=>t.name).join(', ')}. Use + between two shifts on the same day (for example ${db.tpl[0]?db.tpl[0].name:'Morning'}+${db.tpl[1]?db.tpl[1].name:'Evening'}), write OFF for a day off, and leave a cell empty for no change.\nMy rules: [WRITE YOUR RULES HERE, for example: 2 nurses on every shift, nobody works more than 5 days in a row]\nMy staff (Staff ID, Name): [PASTE THE STAFF ID AND NAME COLUMNS FROM THE DOWNLOADED TEMPLATE HERE]`}
+function copyPrompt(){const t=document.getElementById('gptPrompt');t.select();const ok=()=>toast('Copied.');try{navigator.clipboard.writeText(t.value).then(ok,()=>{document.execCommand('copy');ok()})}catch(e){document.execCommand('copy');ok()}}
+function csvOut(rows){return rows.map(r=>r.map(x=>'"'+String(x).replace(/"/g,'""')+'"').join(',')).join('\n')}
+function downloadCSV(rows,name){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+csvOut(rows)],{type:'text/csv'}));a.download=name;a.click()}
+function downloadTemplate(){const dates=[...Array(7)].map((_,i)=>iso(addDays(ws,i))),list=db.staff.filter(s=>s.role!=='master'&&(!rdept||rdept==='ALL'||s.dept===rdept)).slice(0,2000);
+ downloadCSV([['Staff ID','Name',...dates],...list.map(s=>[s.id,s.name,...dates.map(()=>'')])],'mediroster-roster-template.csv')}
+function importView(){if(imp.step==='preview')return importPreviewView();
+ return `<h2 class="text-xl font-bold">Import Roster</h2><p class="text-sm text-slate-500">Upload a roster from Excel, CSV or PDF, or paste a table (for example one made by ChatGPT). You see exactly what will change before anything is saved.</p>
+ ${imp.msg?`<div class="rounded-lg border border-slate-300 bg-white p-3 text-sm">${esc(imp.msg)}</div>`:''}
+ <div class="card p-4 space-y-2"><div class="font-bold">1. Get the fill-in template</div><div class="text-sm text-slate-500">A spreadsheet with your staff down the side and the dates shown on the Roster tab across the top (${esc(rdept&&rdept!=='ALL'?rdept:'all departments')}). Fill each cell with a shift name. Use + for two shifts (Morning+Evening), OFF for a day off, and leave a cell empty for no change.</div><button class="btn2" onclick="downloadTemplate()">Download template (CSV, opens in Excel)</button></div>
+ <div class="card p-4 space-y-2"><div class="font-bold">2. Upload your filled roster, or paste it</div>
+  <div class="flex flex-wrap gap-3 items-end"><input id="impFile" type="file" accept=".xlsx,.xls,.csv,.txt,.pdf" class="text-sm"><div><label class="text-xs font-semibold">Week starting (only needed if the columns say Mon, Tue... without dates)</label><input id="impWeek" type="date" class="inp" value="${iso(ws)}"></div></div>
+  <textarea id="impText" rows="5" class="inp text-sm font-mono" placeholder="...or paste the table here"></textarea>
+  <div class="flex flex-wrap items-center gap-4 text-sm"><label><input type="radio" name="impMode" value="set" ${imp.mode==='set'?'checked':''} onchange="imp.mode='set'"> Replace that day's shifts (recommended)</label><label><input type="radio" name="impMode" value="add" ${imp.mode==='add'?'checked':''} onchange="imp.mode='add'"> Add to existing shifts</label></div>
+  <button class="btn" ${imp.busy?'disabled':''} onclick="importRead()">${imp.busy?'Reading...':'Read roster and show preview'}</button></div>
+ <div class="card p-4 space-y-2"><div class="font-bold">Using ChatGPT? Copy this request</div><textarea readonly rows="7" class="inp text-xs font-mono" id="gptPrompt">${esc(gptPrompt())}</textarea><button class="btn2" onclick="copyPrompt()">Copy request</button></div>
+ ${lastUndo?`<div><button class="btn2" onclick="aiUndo()">Undo the last saved change (${lastUndo.length} day${lastUndo.length===1?'':'s'})</button></div>`:''}`}
+function importPreviewView(){const pv=imp.preview;return `<h2 class="text-xl font-bold">Check before saving</h2><p class="text-sm text-slate-500">Source: ${esc(imp.fileName)}. Nothing has been saved yet.</p><div class="card p-4">${previewHTML(pv,200)}</div>`+
+ (pv.total?`<div class="flex gap-2"><button class="btn" ${imp.busy?'disabled':''} onclick="importConfirm()">${imp.busy?'Saving...':'Confirm and save '+pv.total+' change'+(pv.total===1?'':'s')}</button><button class="btn2" onclick="importCancel()">Cancel</button></div>`:'<div class="text-sm">Nothing would change.</div><button class="btn2" onclick="importCancel()">Back</button>')+(imp.msg?`<div class="text-sm">${esc(imp.msg)}</div>`:'')}
+const nameKey=x=>String(x||'').toLowerCase().replace(/\b(dr|mr|mrs|ms|prof)\b\.?/g,' ').replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
+function staffIndex(){const byName={},byId={};db.staff.forEach(s=>{byId[s.id.toUpperCase()]=s;const k=nameKey(s.name);(byName[k]=byName[k]||[]).push(s)});return {byName,byId}}
+function findStaff(q,ix){const raw=String(q||'').trim();if(!raw)return {err:'empty'};const id=raw.toUpperCase().match(/EMP-\d{4}-[AWM]\d+/);
+ if(id){const s=ix.byId[id[0]];return s?{s}:{err:'Unknown Staff ID '+id[0]}}
+ const k=nameKey(raw);if(ix.byName[k])return ix.byName[k].length===1?{s:ix.byName[k][0]}:{err:'More than one person is called "'+raw+'". Use the Staff ID.'};
+ const toks=k.split(' ').filter(w=>w.length>=2);if(toks.length){const hits=db.staff.filter(s=>{const w=nameKey(s.name).split(' ');return toks.every(t=>w.includes(t))});if(hits.length===1)return {s:hits[0]};if(hits.length>1)return {err:'"'+raw+'" matches more than one person. Use the Staff ID.'}}
+ return {err:'No staff member found for "'+raw+'"'}}
+function csvLine(l){const out=[];let cur='',q=false;for(let i=0;i<l.length;i++){const ch=l[i];if(q){if(ch==='"'){if(l[i+1]==='"'){cur+='"';i++}else q=false}else cur+=ch}else if(ch==='"')q=true;else if(ch===','){out.push(cur.trim());cur=''}else cur+=ch}out.push(cur.trim());return out}
+function parseTextToGrid(text){const lines=String(text).replace(/\r/g,'').split('\n').filter(l=>l.trim());if(!lines.length)return [];
+ const pipes=lines.filter(l=>l.includes('|')).length>=Math.max(1,lines.length/2);
+ return lines.map(l=>{if(pipes){const c=l.split('|').map(x=>x.trim());if(c[0]==='')c.shift();if(c.length&&c[c.length-1]==='')c.pop();return c}
+  if(l.includes('\t'))return l.split('\t').map(x=>x.trim());return csvLine(l)}).filter(r=>r.length&&!r.every(c=>c===''||/^:?-{2,}:?$/.test(c)))}
+const MON={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+function ymdOf(y,m,d){const t=new Date(Date.UTC(y,m,d));return t.getUTCFullYear()===y&&t.getUTCMonth()===m&&t.getUTCDate()===d?t.toISOString().slice(0,10):null}
+function parseDateHead(h,wk,yr){h=String(h==null?'':h).trim();if(!h)return null;let m;
+ if(m=/^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(h))return ymdOf(+m[1],+m[2]-1,+m[3]);
+ if(m=/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/.exec(h)){let y=+m[3];if(y<100)y+=2000;return ymdOf(y,+m[2]-1,+m[1])}
+ if(m=/^(\d{1,2})[\/.](\d{1,2})$/.exec(h))return ymdOf(yr,+m[2]-1,+m[1]);
+ if(m=/(\d{1,2})(?:st|nd|rd|th)?[\s\-\/]*([A-Za-z]{3})[a-z]*\.?(?:[\s,\-\/]*(\d{4}))?/.exec(h)){const mo=MON[m[2].toLowerCase()];if(mo!==undefined)return ymdOf(m[3]?+m[3]:yr,mo,+m[1])}
+ if(/^\d{5}$/.test(h))return new Date(Date.UTC(1899,11,30)+(+h)*864e5).toISOString().slice(0,10);
+ const wd=['mon','tue','wed','thu','fri','sat','sun'].indexOf(h.slice(0,3).toLowerCase());
+ if(wd>=0&&/^(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?(\s|$)/i.test(h)&&wk)return iso(addDays(new Date(wk+'T00:00'),wd));
+ return null}
+function parseCell(c){const t=String(c==null?'':c).trim();if(!t)return {skip:true};
+ const toks=t.split(/[+,&;\/\n]|\band\b/i).map(x=>x.trim()).filter(Boolean),ids=[],bad=[];
+ for(const k of toks){const l=k.toLowerCase();if(/^(off|x|-|–|—|leave|holiday|rest|weekly off|wo)$/.test(l))continue;
+  let hit=db.tpl.find(p=>p.name.toLowerCase()===l)||db.tpl.find(p=>(p.start+'-'+p.end)===l.replace(/\s/g,'').replace(/–|—/g,'-'));
+  if(!hit){const c2=db.tpl.filter(p=>p.name.toLowerCase().startsWith(l));if(c2.length===1)hit=c2[0]}
+  if(hit){if(!ids.includes(hit.id))ids.push(hit.id)}else bad.push(k)}
+ return bad.length?{bad}:{tids:ids}}
+function gridToChanges(grid,wk){const yr=new Date().getFullYear(),ix=staffIndex(),problems=[];let hr=-1,dcols=[];
+ for(let r=0;r<Math.min(grid.length,15);r++){const cols=[];grid[r].forEach((h,c)=>{const d=parseDateHead(h,wk,yr);if(d)cols.push({c,d})});if(cols.length>=1&&cols.length>=Math.floor(grid[r].length/3)){hr=r;dcols=cols;break}}
+ if(hr<0)return null;
+ const head=grid[hr].map(x=>String(x||'').toLowerCase()),isDate=new Set(dcols.map(x=>x.c));
+ let idc=head.findIndex((h,c)=>!isDate.has(c)&&/\bid\b|emp(loyee)? ?(no|code)|code/.test(h)),nmc=head.findIndex((h,c)=>!isDate.has(c)&&c!==idc&&/name|staff|employee|person|nurse|doctor/.test(h));
+ if(idc<0&&nmc<0)nmc=head.findIndex((h,c)=>!isDate.has(c));
+ const changes=[];
+ for(let r=hr+1;r<grid.length;r++){const row=grid[r],who=(idc>=0&&row[idc])?row[idc]:row[nmc],alt=nmc>=0?row[nmc]:'';
+  const cells=dcols.map(({c,d})=>({d,v:row[c]})).filter(x=>String(x.v==null?'':x.v).trim());
+  if(!String(who||'').trim()&&!String(alt||'').trim())continue;
+  let f=findStaff(who,ix);if(f.err&&alt&&nmc!==idc)f=findStaff(alt,ix);
+  if(f.err){if(cells.length)problems.push('Row '+(r+1)+': '+f.err);continue}
+  for(const {d,v} of cells){const pc=parseCell(v);if(pc.skip)continue;if(pc.bad){problems.push(f.s.name+' on '+fmtD(d)+': unknown shift "'+pc.bad.join(', ')+'"');continue}
+   changes.push({sid:f.s.id,dt:d,tids:pc.tids,mode:pc.tids.length?imp.mode:'set'})}}
+ return {changes,problems}}
+async function pdfText(f){await loadScript(PDF_URL);const lib=window.pdfjsLib;lib.GlobalWorkerOptions.workerSrc=PDF_WORKER;const doc=await lib.getDocument({data:await f.arrayBuffer()}).promise,out=[];
+ for(let p=1;p<=doc.numPages;p++){const tc=await (await doc.getPage(p)).getTextContent(),rows={};tc.items.forEach(it=>{if(!it.str||!it.str.trim())return;const y=Math.round(it.transform[5]/4);(rows[y]=rows[y]||[]).push(it)});
+  Object.keys(rows).map(Number).sort((a,b)=>b-a).forEach(y=>{const its=rows[y].sort((a,b)=>a.transform[4]-b.transform[4]);let line='',end=null;its.forEach(it=>{const x=it.transform[4];line+=(end===null?'':(x-end>9?'\t':' '))+it.str.trim();end=x+(it.width||0)});out.push(line)})}
+ return out.join('\n')}
+async function aiExtract(raw,wk){const lines=raw.split('\n').filter(l=>l.trim()),ix=staffIndex(),changes=[],problems=[],chunks=[];for(let i=0;i<lines.length;i+=10)chunks.push(lines.slice(i,i+10));
+ for(let i=0;i<chunks.length;i++){imp.msg='Reading with AI: part '+(i+1)+' of '+chunks.length+'...';render();
+  const j=await api('aiParse',{text:(i?lines[0]+'\n':'')+chunks[i].join('\n'),hint:wk},1);
+  for(const [person,date,shifts] of j.rows){const f=findStaff(person,ix);if(f.err){problems.push(f.err);continue}
+   const pc=parseCell(/^off$/i.test(shifts)?'OFF':shifts);if(pc.skip)continue;if(pc.bad){problems.push(f.s.name+' on '+date+': unknown shift "'+pc.bad.join(', ')+'"');continue}
+   changes.push({sid:f.s.id,dt:date,tids:pc.tids,mode:pc.tids.length?imp.mode:'set'})}}
+ imp.msg='';return {changes,problems:[...new Set(problems)]}}
+async function importRead(){imp.msg='';const fi=document.getElementById('impFile'),f=fi&&fi.files&&fi.files[0],txt=((document.getElementById('impText')||{}).value||'').trim(),wk=(document.getElementById('impWeek')||{}).value||iso(ws);
+ if(!f&&!txt){imp.msg='Choose a file or paste a table first.';return render()}
+ imp.busy=true;imp.fileName=f?f.name:'pasted text';render();
+ try{let grid,raw='';
+  if(f){const ext=(f.name.split('.').pop()||'').toLowerCase();
+   if(ext==='xlsx'||ext==='xls'){await loadScript(XLSX_URL);const wb=XLSX.read(await f.arrayBuffer(),{type:'array',cellDates:true});grid=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,raw:false,dateNF:'yyyy-mm-dd',defval:''}).map(r=>r.map(x=>String(x==null?'':x).trim()));raw=grid.map(r=>r.join('\t')).join('\n')}
+   else if(ext==='pdf'){raw=await pdfText(f);grid=parseTextToGrid(raw)}
+   else{raw=await f.text();grid=parseTextToGrid(raw)}}
+  else{raw=txt;grid=parseTextToGrid(raw)}
+  let res=gridToChanges(grid,wk);
+  if(!res||(!res.changes.length&&!res.problems.length)){
+   if(!db.ai)throw new Error('I could not recognise the layout of this roster. Use the template in step 1, or switch on the AI Assistant (guide, Part F) so I can read free-form rosters.');
+   res=await aiExtract(raw,wk)}
+  if(!res.changes.length)throw new Error('I found no roster entries to import.'+(res.problems.length?' '+res.problems[0]:''));
+  imp.problems=res.problems;imp.proposed=res.changes;
+  const all=imp.proposed;let total=0,noop=0,sample=[],problems=[...res.problems],from='',to='';
+  for(let i=0;i<all.length;i+=3000){const pv=(await api('previewChanges',{changes:all.slice(i,i+3000)},1)).preview;total+=pv.total;noop+=pv.noop;if(sample.length<300)sample=sample.concat(pv.sample).slice(0,300);problems.push(...pv.problems);if(pv.from&&(!from||pv.from<from))from=pv.from;if(pv.to&&pv.to>to)to=pv.to}
+  imp.preview={total,noop,people:new Set(all.map(x=>x.sid)).size,from,to,sample,problems:problems.slice(0,40),moreProblems:Math.max(0,problems.length-40)};imp.step='preview';imp.msg=''
+ }catch(e){imp.msg=e.message;imp.step='start'}
+ imp.busy=false;render()}
+async function importConfirm(){imp.busy=true;render();let applied=0,undo=[];
+ try{const all=imp.proposed;for(let i=0;i<all.length;i+=1500){const j=await api('applyChanges',{changes:all.slice(i,i+1500),source:'import',note:imp.fileName},1);applied+=j.applied;undo=undo.concat(j.undo||[])}
+  lastUndo=undo.length?undo:null;imp={step:'start',mode:imp.mode,busy:false,msg:'Done. '+applied+' roster change'+(applied===1?'':'s')+' saved and recorded in the System Logs. Open the Roster tab to see them.',fileName:'',proposed:[],problems:[],preview:null}}
+ catch(e){imp.busy=false;imp.msg='Could not finish saving: '+e.message+' Some changes may already be saved. Importing the same file again is safe.'}render()}
+function importCancel(){imp={step:'start',mode:imp.mode,busy:false,msg:'',fileName:'',proposed:[],problems:[],preview:null};render()}
+
+/* ---------- STATUS BAR, IN-APP ALERTS, LIVE REFRESH ---------- */
+const SHIFT_MSG='Your shift has started. Please ensure you are logged into your dashboard and have clocked in via the designated hospital geofence.';
+function statusHTML(){const l=db.mailLog||[];return `<div class="rounded-xl bg-slate-900 text-slate-100 px-4 py-3 flex flex-wrap items-center justify-between gap-2"><div class="text-sm"><span class="text-slate-400 mr-2">Email status:</span><span id="stxt">${l.length?esc(l[0].t+'  '+l[0].msg):'📧 Waiting for the next automated email…'}</span></div><span class="text-xs font-semibold px-2 py-1 rounded-md bg-emerald-600">Live: server email</span></div>`}
+const NK=()=>'mr_notes_'+(user?user.id:'');
+function notes(){try{return JSON.parse(localStorage.getItem(NK())||'[]')}catch(e){return[]}}
+function putNotes(a){try{localStorage.setItem(NK(),JSON.stringify(a.slice(0,50)))}catch(e){}}
+function badgeHTML(){const u=user?notes().filter(n=>!n.read).length:0;return u?`<span class="absolute -top-1.5 -right-1.5 bg-red-600 text-xs rounded-full px-1.5">${u}</span>`:''}
+function updBadge(){const e=document.getElementById('bb');if(e)e.innerHTML=badgeHTML()}
+function toggleBell(){bell=!bell;if(!bell)putNotes(notes().map(n=>({...n,read:true})));render()}
+function fire(msg){const b=document.getElementById('banner');b.innerHTML=`<div class="font-bold text-sm mb-1">🔔 Shift started</div><div class="text-sm">${esc(msg)}</div><button class="mt-2 bg-white text-blue-800 rounded-lg px-3 py-1 text-sm font-semibold" onclick="this.parentNode.classList.add('hidden')">Dismiss</button>`;b.classList.remove('hidden');
+ try{if('Notification' in window&&Notification.permission==='granted')new Notification('MediRoster',{body:msg})}catch(e){}
+ try{const a=new(window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator();o.connect(a.destination);o.frequency.value=880;o.start();o.stop(a.currentTime+.25)}catch(e){}}
+function enableAlerts(){if(!('Notification' in window))return toast('Device alerts are not supported in this browser.');try{Notification.requestPermission().then(p=>toast(p==='granted'?'Device alerts enabled.':'Device alerts were not allowed.'))}catch(e){toast('Device alerts are blocked here.')}}
+function inApp(msg){putNotes([{msg,t:new Date().toLocaleString('en-GB'),read:false},...notes()]);fire(msg);updBadge()}
+/* In-app banner for the signed-in person's own shift start (emails are sent by the server). */
+function tick(){if(!user||!db)return;const n=Date.now();
+ for(let d=-1;d<=0;d++){const dt=iso(addDays(new Date(),d));for(const t of shifts(user.id,dt)){
+  const diff=n-new Date(dt+'T'+t.start).getTime();if(diff<0||diff>6e5)continue;
+  const key='mr_seen_'+user.id+'|'+dt+'|'+t.id;try{if(localStorage.getItem(key))continue;localStorage.setItem(key,'1')}catch(e){continue}inApp(SHIFT_MSG)}}}
+function startPolling(){clearInterval(poll);clearInterval(tk);poll=setInterval(softRefresh,300000);tk=setInterval(tick,30000);
+ if(!vis){vis=true;document.addEventListener('visibilitychange',()=>{if(!document.hidden&&Date.now()-lastFetch>120000)softRefresh()})}}
+async function softRefresh(){if(!user||document.hidden)return;const f=document.activeElement;if(f&&/INPUT|SELECT|TEXTAREA/.test(f.tagName))return;
+ const before=JSON.stringify(db);try{await api('state',{},1);if(JSON.stringify(db)!==before)render()}catch(e){}}
+function prefill(){const m=/^#u=([A-Za-z0-9-]+)&p=([A-Za-z0-9]+)$/.exec(location.hash||'');if(!m)return;const a=document.getElementById('lid'),b=document.getElementById('lpw');
+ if(a&&b){a.value=m[1];b.value=m[2];toast('Your Staff ID and temporary passcode are filled in. Press Sign In.')}try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}}
+async function boot(){if(!token){loginView();prefill();return}try{await api('state',{},1);await enter()}catch(e){token=null;loginView();prefill()}}
+boot();
+</script></body></html>
