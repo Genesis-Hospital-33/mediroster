@@ -93,6 +93,16 @@ function dist(a, b, c, d) {
   const h = Math.sin(p / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(q / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(h));
 }
+const tsOfKey = (k) => Number(String(k).split('/').pop().split('-')[0]);
+const dmRoom = (a, b) => 'dm_' + [a, b].sort().join('_');
+async function chatKeys(kv, room, since, limit) {
+  let out = []; const now = Date.now();
+  for (let d = 0; d < (since ? 2 : 14) && (since || out.length < limit); d++) {
+    const ks = (await kv.list(`chat/${room}/${ymd(now - d * 864e5)}/`)).sort();
+    out = [...(since ? ks.filter((k) => tsOfKey(k) >= since) : ks), ...out];
+  }
+  return out.slice(-limit);
+}
 const readWeek = async (kv, mon) => Object.assign({}, ...(await Promise.all(SHARDS.map((h) => kv.get('roster/' + mon + '/' + h)))).filter(Boolean));
 const defaultCfg = () => ({
   depts: ['Management', 'Emergency', 'ICU', 'General Ward', 'Pharmacy'],
@@ -133,6 +143,7 @@ async function resolveChanges(kv, cfg, byId, list) {
   await Promise.all([...new Set(valid.map((v) => mondayOf(v.dt)))].map(async (w) => { maps[w] = await readWeek(kv, w); }));
   const rows = []; let noop = 0; const cmp = byStart(order);
   for (const v of valid) {
+    if (asList(maps[mondayOf(v.dt)][v.s.id + '|' + v.dt]).includes('LEAVE')) { problems.push(v.s.name + ' is on approved leave on ' + v.dt + ' (skipped)'); continue; }
     const before = asList(maps[mondayOf(v.dt)][v.s.id + '|' + v.dt]).filter((t) => tplIds.has(t)).sort(cmp);
     const after = (v.mode === 'add' ? [...new Set([...before, ...v.tids])] : v.mode === 'remove' ? before.filter((t) => !v.tids.includes(t)) : v.tids).slice().sort(cmp);
     if (before.length === after.length && before.every((x, i) => x === after[i])) { noop++; continue; }
@@ -278,6 +289,7 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
       };
       if (mgr) {
         out.ai = !!(env.AI_API_KEY || env.GEMINI_API_KEY);
+        out.leavePending = (await kv.list('lvpend/')).filter((k) => { const sid = k.split('/')[1], t = byId.get(sid); return t && t.id !== me.id && (me.role === 'master' || t.role === 'worker'); }).length;
         out.att = (await listAtt(kv, 'att/' + today + '/', byId)).slice(0, 500);
         out.pending = (await kv.list('pend/')).map((k) => k.slice(5)).filter((id) => byId.has(id)).map((id) => ({ id, name: byId.get(id).name }));
         await Promise.all(out.pending.map(async (x) => { const a = await kv.get('acct/' + x.id); x.resetAt = a && a.resetAt; }));
@@ -357,6 +369,14 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
     };
     const saveStaff = () => kv.set('staff', staff);
     const saveCfg = () => kv.set('cfg', cfg);
+    const putMsg = async (room, from, text) => { const ts = Date.now(); await kv.set(`chat/${room}/${ymd(ts)}/${String(ts).padStart(13, '0')}-${randomBytes(3).toString('hex')}`, { ts, from: from.id, name: from.name, role: from.role, text }); return ts; };
+    const dmMark = (from, to, ts) => Promise.all([kv.set('dmidx/' + from.id + '/' + to.id, { ts }), kv.set('dmidx/' + to.id + '/' + from.id, { ts }), kv.set('dmnew/' + to.id + '/' + from.id, { ts })]);
+    const chatRoom = () => {
+      if (p.room !== 'dm') return { room: 'all' };
+      const o = find(p.peer);
+      if (o.id === me.id || (me.role === 'worker' && o.role === 'worker')) fail(403, 'Private messages are between a worker and an Admin or the Master Admin (or between Admins).');
+      return { room: dmRoom(me.id, o.id), other: o };
+    };
 
     switch (action) {
       case 'state': return reply();
@@ -368,11 +388,98 @@ export async function handle({ kv, env, origin, send = sendMail }, body) {
         const chosen = cfg.tpl.filter((t) => want.includes(t.id)).sort((x, y) => x.start.localeCompare(y.start));
         if (chosen.length !== want.length) fail(400, 'Unknown shift.');
         const k = 'roster/' + mondayOf(dt) + '/' + shardOf(s.id), part = (await kv.get(k)) || {};
+        if (asList(part[s.id + '|' + dt]).includes('LEAVE') && !isMaster) fail(403, 'This day is approved leave. Only the Master Admin can change it.');
         if (chosen.length) part[s.id + '|' + dt] = chosen.map((t) => t.id); else delete part[s.id + '|' + dt];
         await kv.set(k, part);
         return ok({ ok: true });
       }
       case 'setDes': { needMaster(); const s = find(p.id); s.designation = clean(p.v, 60); await saveStaff(); await log(me.name, `Designation for ${s.name} set to "${s.designation || '(none)'}"`); return reply(); }
+      case 'leaveApply': {
+        if (isMaster) fail(400, 'The Master Admin marks days off directly instead of applying.');
+        const from = clean(p.from, 10), to = clean(p.to || p.from, 10), today = todayIn(tz);
+        if (!validDate(from) || !validDate(to) || to < from) fail(400, 'Choose valid dates.');
+        if (from < today) fail(400, 'Leave must start today or later.');
+        const span = (Date.parse(to) - Date.parse(from)) / 864e5 + 1;
+        if (span > 31) fail(400, 'Please ask for 31 days or fewer at a time.');
+        if ((await kv.list('lvpend/' + me.id + '/')).length >= 5) fail(400, 'You already have 5 requests waiting. Please wait for a decision.');
+        const rid = 'r' + Date.now() + randomInt(100, 999), days = [...Array(span)].map((_, i) => ymd(Date.parse(from) + i * 864e5));
+        await kv.set('lvreq/' + me.id + '/' + rid, { rid, sid: me.id, from, to, days, reason: clean(p.reason, 200), status: 'pending', createdAt: Date.now() });
+        await kv.set('lvpend/' + me.id + '/' + rid, 1);
+        await log(me.name, `Applied for leave ${from} to ${to}`); return ok({ ok: true });
+      }
+      case 'leaveList': {
+        const mine = await Promise.all((await kv.list('lvreq/' + me.id + '/')).sort().reverse().slice(0, 20).map((k) => kv.get(k)));
+        const out = { mine: mine.filter(Boolean), queue: [] };
+        if (isMgr) {
+          const keys = (await kv.list('lvpend/')).filter((k) => { const t = byId.get(k.split('/')[1]); return t && t.id !== me.id && (isMaster || t.role === 'worker'); }).slice(0, 100);
+          const reqs = await Promise.all(keys.map((k) => kv.get('lvreq/' + k.slice(7))));
+          out.queue = reqs.filter(Boolean).map((r) => ({ ...r, name: (byId.get(r.sid) || {}).name, dept: (byId.get(r.sid) || {}).dept, role: (byId.get(r.sid) || {}).role })).sort((a, b) => a.createdAt - b.createdAt);
+        }
+        return ok(out);
+      }
+      case 'leaveCancel': {
+        const k = 'lvreq/' + me.id + '/' + clean(p.rid, 40), r = await kv.get(k);
+        if (!r || r.status !== 'pending') fail(400, 'That request cannot be cancelled.');
+        r.status = 'cancelled'; await kv.set(k, r); await kv.del('lvpend/' + me.id + '/' + r.rid); return ok({ ok: true });
+      }
+      case 'leaveDecide': {
+        needMgr(); const t = find(p.sid), k = 'lvreq/' + t.id + '/' + clean(p.rid, 40), r = await kv.get(k);
+        if (!r || r.status !== 'pending') fail(400, 'That request was already decided.');
+        if (t.id === me.id || t.role === 'master') fail(403, 'You cannot decide your own leave.');
+        if (!isMaster && t.role !== 'worker') fail(403, "Only the Master Admin can decide an Admin's leave.");
+        const ok1 = new Set(r.days), days = [...new Set((Array.isArray(p.approve) ? p.approve : []).map(String))].filter((d) => ok1.has(d)).sort();
+        if (days.length) await applyRows(kv, days.map((dt) => ({ sid: t.id, dt, after: ['LEAVE'] })));
+        r.status = !days.length ? 'rejected' : days.length === r.days.length ? 'approved' : 'partial'; r.approvedDays = days; r.decidedBy = me.name; r.decidedAt = Date.now(); r.note = clean(p.note, 300);
+        await kv.set(k, r); await kv.del('lvpend/' + t.id + '/' + r.rid);
+        await log(me.name, `Leave for ${t.name} (${r.from} to ${r.to}): ${r.status}, ${days.length} of ${r.days.length} days approved`);
+        const said = r.status === 'approved' ? `approved for all ${days.length} days` : r.status === 'partial' ? `partly approved (${days.length} of ${r.days.length} days: ${days.slice(0, 8).join(', ')}${days.length > 8 ? ' ...' : ''})` : 'not approved';
+        const ts = await putMsg(dmRoom(me.id, t.id), me, clean(`Your leave request (${r.from} to ${r.to}) was ${said}.${r.note ? ' Message: ' + r.note : ''}`, 500)); await dmMark(me, t, ts);
+        return reply();
+      }
+      case 'markLeave': {
+        needMaster(); const t = find(p.sid), from = clean(p.from, 10), to = clean(p.to || p.from, 10);
+        if (!validDate(from) || !validDate(to) || to < from) fail(400, 'Choose valid dates.');
+        const span = (Date.parse(to) - Date.parse(from)) / 864e5 + 1; if (span > 62) fail(400, 'Please use 62 days or fewer at a time.');
+        const dates = [...Array(span)].map((_, i) => ymd(Date.parse(from) + i * 864e5));
+        if (p.on === false) {
+          const maps = {}; await Promise.all([...new Set(dates.map(mondayOf))].map(async (w) => { maps[w] = await readWeek(kv, w); }));
+          await applyRows(kv, dates.filter((dt) => asList(maps[mondayOf(dt)][t.id + '|' + dt]).includes('LEAVE')).map((dt) => ({ sid: t.id, dt, after: [] })));
+          await log(me.name, `Removed leave for ${t.name} (${from} to ${to})`);
+        } else { await applyRows(kv, dates.map((dt) => ({ sid: t.id, dt, after: ['LEAVE'] }))); await log(me.name, `Marked ${t.name} on leave (${from} to ${to})`); }
+        return reply();
+      }
+      case 'chatPing':
+      case 'chatInit': {
+        let allLatest = 0;
+        for (let d = 0; d < 2 && !allLatest; d++) { const ks = (await kv.list(`chat/all/${ymd(Date.now() - d * 864e5)}/`)).sort(); if (ks.length) allLatest = tsOfKey(ks[ks.length - 1]); }
+        const unread = (await kv.list('dmnew/' + me.id + '/')).map((k) => k.split('/')[2]).filter((i) => byId.has(i)).map((i) => ({ id: i, name: byId.get(i).name }));
+        const out = { allLatest, unread };
+        if (action === 'chatInit') {
+          out.peers = me.role === 'worker' ? staff.filter((x) => x.role !== 'worker' && x.id !== me.id).slice(0, 200).map((x) => ({ id: x.id, name: x.name, role: x.role, designation: x.designation || '' })) : [];
+          out.dms = (await kv.list('dmidx/' + me.id + '/')).map((k) => k.split('/')[2]).filter((i) => byId.has(i)).slice(0, 100).map((i) => ({ id: i, name: byId.get(i).name, role: byId.get(i).role }));
+        }
+        return ok(out);
+      }
+      case 'chatFetch': {
+        const { room, other } = chatRoom(), since = Math.max(0, Number(p.since) || 0);
+        const keys = await chatKeys(kv, room, since, since ? 100 : 50);
+        const msgs = (await Promise.all(keys.map(async (k) => { const m = await kv.get(k); return m && { ...m, k }; }))).filter(Boolean);
+        if (other) await kv.del('dmnew/' + me.id + '/' + other.id);
+        return ok({ msgs });
+      }
+      case 'chatSend': {
+        const text = clean(p.text, 500); if (!text) fail(400, 'Type a message first.');
+        const { room, other } = chatRoom(), lastK = 'chatlast/' + me.id, last = (await kv.get(lastK)) || 0;
+        if (Date.now() - last < 700) fail(429, 'Slow down a little.');
+        await kv.set(lastK, Date.now());
+        const ts = await putMsg(room, me, text);
+        if (other) await dmMark(me, other, ts);
+        return ok({ ok: true, ts });
+      }
+      case 'chatDelete': {
+        needMaster(); const k = String(p.k || ''); if (!k.startsWith('chat/all/')) fail(400, 'Only group messages can be deleted.');
+        await kv.del(k); await log(me.name, 'Deleted a message from the everyone chat'); return ok({ ok: true });
+      }
       case 'setStaffDept': {
         needMaster(); const s = find(p.id), d = clean(p.dept, 60);
         if (!cfg.depts.includes(d)) fail(400, 'Choose one of your departments.');
